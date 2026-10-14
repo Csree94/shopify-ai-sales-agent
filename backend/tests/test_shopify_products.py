@@ -60,7 +60,7 @@ def _product_node(title: str) -> dict:
                     "id": f"gid://shopify/ProductVariant/1-{title}",
                     "title": "Default",
                     "sku": f"SKU-{title}",
-                    "price": {"amount": "10.00", "currencyCode": "USD"},
+                    "price": "10.00",
                     "availableForSale": True,
                 }
             ]
@@ -350,3 +350,113 @@ def test_search_requires_q_param():
         response = client.get("/api/products/search")
 
     assert response.status_code == 422
+
+
+def _cc_settings() -> "ShopifySettings":
+    return ShopifySettings(
+        store_domain="test-store.myshopify.com",
+        api_version="2026-10",
+        client_id="fake-client-id",
+        client_secret="fake-client-secret",
+        timeout_seconds=5.0,
+    )
+
+
+def test_scalar_variant_price_regression(monkeypatch):
+    """Regression for the live failure on 2026-10:
+
+    `Selections can't be made on scalars (field 'price' returns Money but
+    has selections ["amount", "currencyCode"])`.
+
+    The outgoing query must select `price` as a bare scalar, and the parsed
+    variant price must be the monetary string with currency from the
+    product's price range.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        query = body["query"]
+        # Reproduce the exact live error if the invalid selection is sent.
+        if "price {" in query:
+            return httpx.Response(
+                200,
+                json=_gql_response(
+                    None,
+                    errors=[
+                        {
+                            "message": "Selections can't be made on scalars "
+                            "(field 'price' returns Money but has selections "
+                            "[\"amount\", \"currencyCode\"])"
+                        }
+                    ],
+                ),
+            )
+        # Corrected query: variant price is selected as a bare scalar.
+        assert "price\n" in query
+        return httpx.Response(
+            200, json=_gql_response(_product_cursor_page(["Hat"], "c1", False))
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get("/api/products?limit=1")
+
+    assert response.status_code == 200
+    product = response.json()["products"][0]
+    variant = product["variants"][0]
+    # Scalar Money stays a monetary string exactly as Shopify returned it.
+    assert variant["price"] == "10.00"
+    # Currency is carried by the product's MoneyV2 price range.
+    assert variant["currency"] == "USD"
+    assert product["price_min"] == "10.00"
+    assert product["price_max"] == "25.00"
+
+
+def test_products_use_dynamically_acquired_token(monkeypatch):
+    """Client-credentials mode: token endpoint hit first, token header
+    injected into the GraphQL call, secret never in any response."""
+    graphql_requests: list[httpx.Request] = []
+    token_calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/admin/oauth/access_token"):
+            token_calls["count"] += 1
+            assert request.headers["Content-Type"].startswith(
+                "application/x-www-form-urlencoded"
+            )
+            form = dict(
+                part.split("=", 1) for part in request.content.decode().split("&")
+            )
+            assert form["grant_type"] == "client_credentials"
+            assert form["client_id"] == "fake-client-id"
+            assert form["client_secret"] == "fake-client-secret"
+            return httpx.Response(
+                200, json={"access_token": "shppa_fake_token", "expires_in": 86399}
+            )
+        graphql_requests.append(request)
+        return httpx.Response(
+            200, json=_gql_response(_product_cursor_page(["Shirt"], None, False))
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    client = ShopifyAdminClient(settings=_cc_settings(), http_client=http_client)
+    _install_factory(monkeypatch, client)
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as test_client:
+        response = test_client.get("/api/products?limit=1")
+
+    assert response.status_code == 200
+    assert [p["title"] for p in response.json()["products"]] == ["Shirt"]
+    assert token_calls["count"] == 1
+    assert len(graphql_requests) == 1
+    assert (
+        graphql_requests[0].headers["X-Shopify-Access-Token"] == "shppa_fake_token"
+    )
+    # Neither the token nor the client secret leaks into the API response.
+    assert "shppa_fake_token" not in response.text
+    assert "fake-client-secret" not in response.text

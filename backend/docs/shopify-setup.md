@@ -1,4 +1,4 @@
-# Shopify Admin API setup (Phase 4 — product retrieval)
+# Shopify Admin API setup (Phase 4 — product retrieval; Phase 5 — authentication)
 
 ## What this phase uses
 
@@ -11,21 +11,60 @@
 - **Read-only.** The client only runs `products(...)` queries. It never
   creates, updates, or deletes products or inventory.
 
+## Authentication (Phase 5)
+
+Two supported modes, decided automatically from your `.env`:
+
+1. **Client-credentials grant (preferred).** Set `SHOPIFY_CLIENT_ID` and
+   `SHOPIFY_CLIENT_SECRET`. The backend requests tokens per Shopify's
+   official client-credentials flow for apps with direct API access:
+
+   `POST https://{store}.myshopify.com/admin/oauth/access_token` with
+   form fields `grant_type=client_credentials`, `client_id`, `client_secret`.
+
+   The response contains `access_token` and `expires_in` ≈ **86399**
+   seconds (token validity ≈ **24 hours**, per shopify.dev's access token
+   documentation). The backend caches the token in memory and refreshes
+   it 5 minutes before expiry (and after any upstream 401). Tokens are
+   never logged.
+2. **Static custom-app token.** If no client credentials are configured,
+   a real (non-placeholder) `SHOPIFY_ADMIN_ACCESS_TOKEN` from a custom
+   app's *Admin API access token* is used directly. Note the granted
+   scopes in this mode come from the app's Admin API configuration.
+
+Client credentials take precedence when both are configured; a
+placeholder-only static token never silently overrides them.
+
 ## Required scopes
 
-Create a **custom app** in the Shopify admin:
+Create the app in one of these places, matching your authentication mode:
 
-1. Store admin → *Settings → Apps and sales channels → Develop apps*.
-2. *Create an app*, then under *Configuration → Admin API integration* grant:
-   - `read_products` — required (product titles, descriptions, prices,
-     variants, SKU, availability).
-3. *Install the app* and reveal the **Admin API access token**.
+- *Dev Dashboard app* (for the client-credentials grant):
+  shopify.dev dashboard → *Store access → Direct API access*, enable Admin
+  API access and select scopes.
+- *Custom app* (for the static token mode):
+  Store admin → *Settings → Apps and sales channels → Develop apps* →
+  create an app → Admin API integration — grant:
 
-### Optional (only if you need exact stock counts later)
+  - `read_products` — required (product titles, descriptions, prices,
+    variants, SKU, availability).
 
-- `read_inventory` — would let us report precise per-location quantities.
-  Phase 4 reports availability from `totalInventory` / `availableForSale`,
-  which `read_products` already provides, so this scope is not required now.
+### Permission (scope) testing matrix
+
+Every scope the planned project needs, why, and how each is tested
+individually. Never assume a permission works just because it is listed in
+the app settings — each one is proven with its own request.
+
+| Scope | Feature that needs it | How we test it individually |
+|---|---|---|
+| `read_products` | Product listing & search (`GET /api/products*`) — Phases 4–5 | Send `GET /api/products?limit=3` against the dev store: expect HTTP 200 with real product titles. If the scope is missing, Shopify returns GraphQL errors we surface as 502 with the message echoed — that failure is the scope test failing. |
+| `read_inventory` | Precise per-location stock for stock-aware sales answers (planned) | Run a minimal GraphQL probe `inventoryItem / inventoryLevel` query once the feature exists; absence shows as a GraphQL error naming the inaccessible field, surfaced as 502. Not required in Phase 5. |
+| Storefront token scopes (`unauthenticated_read_product_listings`) | Future storefront-facing chat/checkout display | Storefront API probe: `shop { products(first:1) { nodes { title } } }`. Not required in Phase 5; requires `SHOPIFY_STOREFRONT_ACCESS_TOKEN` only when that feature is built. |
+| `write_*` scopes | **None.** The agent is read-only; we will never grant write scopes in this project. | Not applicable — deliberately not requested. |
+
+Each planned feature ships with its own minimal probe before relying on
+any scope; failures against the dev store are reported as setup issues,
+not code issues.
 
 ## Environment configuration
 
@@ -35,9 +74,18 @@ Set these in your **local `.env`** (copy from `.env.example`). The real
 | Variable                      | Meaning                                        |
 |-------------------------------|------------------------------------------------|
 | `SHOPIFY_STORE_DOMAIN`        | `your-store.myshopify.com` (the Admin API must target the myshopify domain) |
-| `SHOPIFY_ADMIN_ACCESS_TOKEN`  | Admin API access token from the custom app (secret — never commit). |
+| `SHOPIFY_CLIENT_ID`           | Client id for the client-credentials grant (Dev Dashboard app). |
+| `SHOPIFY_CLIENT_SECRET`       | Client secret for the client-credentials grant (secret — never commit). |
+| `SHOPIFY_ADMIN_ACCESS_TOKEN`  | Admin API access token from the custom app (secret — never commit). Optional when client credentials are set. |
 | `SHOPIFY_API_VERSION`         | Optional, defaults to `2026-10`.               |
 | `SHOPIFY_HTTP_TIMEOUT_SECONDS`| Optional, defaults to `15`, capped at `60`.    |
+
+`SHOPIFY_STOREFRONT_ACCESS_TOKEN` is **not** used in this phase — it is
+reserved for future storefront-facing features.
+
+Files `backend/.env` and the repo-root `.env` are loaded automatically at
+startup (python-dotenv, silently, no values printed). Existing process
+environment variables always take precedence over file values.
 
 ## HTTP surface (Phase 4)
 

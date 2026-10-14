@@ -21,6 +21,17 @@ from __future__ import annotations
 import httpx
 
 from app.config import MAX_GQL_PAGE_SIZE, ShopifySettings, load_shopify_settings
+from app.shopify_auth import ShopifyTokenManager
+from app.shopify_errors import (
+    ShopifyAuthError,
+    ShopifyClientError,
+    ShopifyThrottledError,
+    ShopifyTimeoutError,
+    ShopifyUpstreamError,
+)
+
+# Re-exported for backward compatibility with earlier phases/test modules.
+__all__ = ["ShopifyAdminClient", "ShopifyAuthError", "ShopifyClientError", "ShopifyThrottledError", "ShopifyTimeoutError", "ShopifyUpstreamError"]
 
 PRODUCT_FIELDS = """
   id
@@ -36,7 +47,7 @@ PRODUCT_FIELDS = """
       id
       title
       sku
-      price { amount currencyCode }
+      price
       availableForSale
     }
   }
@@ -54,46 +65,35 @@ query Products($first: Int!, $after: String, $query: String) {
 """
 
 
-class ShopifyClientError(Exception):
-    """Base class for Shopify client errors (message never contains secrets)."""
-
-
-class ShopifyAuthError(ShopifyClientError):
-    """Authentication/authorization failed (401/403): token or scopes invalid."""
-
-
-class ShopifyThrottledError(ShopifyClientError):
-    """Shopify leaky-bucket throttle; optionally carries a retry hint (seconds)."""
-
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-class ShopifyTimeoutError(ShopifyClientError):
-    """Request timed out before Shopify responded."""
-
-
-class ShopifyUpstreamError(ShopifyClientError):
-    """Shopify returned an unexpected status or an unusable payload."""
-
-
 class ShopifyAdminClient:
-    """Read-only GraphQL Admin API client bound to validated settings."""
+    """Read-only GraphQL Admin API client bound to validated settings.
+
+    Tokens are obtained through the injected/token manager app-wide flow:
+    static custom-app token OR client-credentials grant with in-memory
+    caching and proactive refresh (see app.shopify_auth).
+    """
 
     def __init__(
         self,
         settings: ShopifySettings | None = None,
         http_client: httpx.Client | None = None,
+        token_manager: ShopifyTokenManager | None = None,
     ) -> None:
         self._settings = settings or load_shopify_settings()
         self._http = http_client or httpx.Client(
             timeout=self._settings.timeout_seconds
         )
+        self._tokens = token_manager or ShopifyTokenManager(
+            self._settings, self._http
+        )
 
     @property
     def settings(self) -> ShopifySettings:
         return self._settings
+
+    @property
+    def token_manager(self) -> ShopifyTokenManager:
+        return self._tokens
 
     # -- public queries ----------------------------------------------------
 
@@ -125,10 +125,16 @@ class ShopifyAdminClient:
         return connection
 
     def _request(self, query: str, variables: dict) -> dict:
-        """POST one GraphQL request; translate failures into typed errors."""
+        """POST one GraphQL request; translate failures into typed errors.
+
+        The access token comes from the token manager (static or dynamically
+        acquired) and is placed only in the request header — never in URLs,
+        logs or error messages. A 401/403 invalidates the cached token so the
+        next request re-authenticates.
+        """
         headers = {
             "Content-Type": "application/json",
-            "X-Shopify-Access-Token": self._settings.admin_api_token,
+            "X-Shopify-Access-Token": self._tokens.get_access_token(),
         }
         try:
             response = self._http.post(
@@ -147,6 +153,9 @@ class ShopifyAdminClient:
 
         status = response.status_code
         if status in (401, 403):
+            # Drop any cached token so the next request re-authenticates
+            # (no automatic retry within the same request).
+            self._tokens.invalidate_cached_token()
             raise ShopifyAuthError(
                 f"Shopify rejected the Admin API request (HTTP {status}). "
                 "Check SHOPIFY_ADMIN_ACCESS_TOKEN and the app's read_products scope."
@@ -227,13 +236,17 @@ def normalise_product(node: dict) -> dict:
     price_range = node.get("priceRange") or {}
     minimum = price_range.get("minVariantPrice") or {}
     maximum = price_range.get("maxVariantPrice") or {}
+    # ProductVariant.price is the scalar Money type (a monetary *string*, e.g.
+    # "10.00", per the Shopify Admin GraphQL schema) — no nested amount/currency
+    # selection is valid. Currency therefore comes from the product's price
+    # range (MoneyV2), which does carry currencyCode.
     variants = [
         {
             "id": v.get("id"),
             "title": v.get("title"),
             "sku": v.get("sku"),
-            "price": _amount(v.get("price")),
-            "currency": ((v.get("price") or {}).get("currencyCode")),
+            "price": v.get("price") if isinstance(v.get("price"), str) else None,
+            "currency": minimum.get("currencyCode"),
             "available_for_sale": v.get("availableForSale"),
         }
         for v in ((node.get("variants") or {}).get("nodes") or [])
