@@ -33,7 +33,9 @@ from app.shopify_errors import (
 # Re-exported for backward compatibility with earlier phases/test modules.
 __all__ = ["ShopifyAdminClient", "ShopifyAuthError", "ShopifyClientError", "ShopifyThrottledError", "ShopifyTimeoutError", "ShopifyUpstreamError"]
 
-PRODUCT_FIELDS = """
+# --- Product field blocks ---------------------------------------------------
+# Product scalar + range fields (identical in both queries).
+_PRODUCT_BASE_FIELDS = """
   id
   title
   description
@@ -42,6 +44,9 @@ PRODUCT_FIELDS = """
     minVariantPrice { amount currencyCode }
     maxVariantPrice { amount currencyCode }
   }
+"""
+
+_STANDARD_VARIANT_FIELDS = """
   variants(first: 50) {
     nodes {
       id
@@ -53,16 +58,42 @@ PRODUCT_FIELDS = """
   }
 """
 
-PRODUCTS_QUERY = """
-query Products($first: Int!, $after: String, $query: String) {
-  products(first: $first, after: $after, query: $query) {
-    pageInfo { endCursor hasNextPage }
+# Inventory probe (Phase 6): exactly one additional scalar field per variant.
+_INVENTORY_VARIANT_FIELDS = """
+  variants(first: 50) {
     nodes {
-""" + PRODUCT_FIELDS + """
+      id
+      title
+      sku
+      price
+      inventoryQuantity
+      availableForSale
     }
   }
-}
 """
+
+
+def _products_query(variant_fields: str) -> str:
+    """Build the products connection query with the given variant selection."""
+    return (
+        "\nquery Products($first: Int!, $after: String, $query: String) {\n"
+        "  products(first: $first, after: $after, query: $query) {\n"
+        "    pageInfo { endCursor hasNextPage }\n"
+        "    nodes {\n"
+        + _PRODUCT_BASE_FIELDS
+        + variant_fields
+        + "  }\n"
+        "  }\n"
+        "}\n"
+    )
+
+
+PRODUCT_FIELDS = _PRODUCT_BASE_FIELDS + _STANDARD_VARIANT_FIELDS
+PRODUCTS_QUERY = _products_query(_STANDARD_VARIANT_FIELDS)
+
+# Query used by the inventory probe endpoint; identical shape to PRODUCTS_QUERY
+# except for the single extra scalar `inventoryQuantity` per variant.
+PRODUCTS_INVENTORY_QUERY = _products_query(_INVENTORY_VARIANT_FIELDS)
 
 
 class ShopifyAdminClient:
@@ -111,14 +142,27 @@ class ShopifyAdminClient:
         limit = _clamp_limit(limit)
         return self._fetch_products(first=limit, after=cursor, query=query.strip())
 
+    def list_inventory(self, limit: int, cursor: str | None = None) -> dict:
+        """Inventory probe (Phase 6): read-only per-variant stock quantities.
+
+        Reuses the same products connection and pagination with exactly one
+        extra scalar (`inventoryQuantity`) per variant. Strictly read-only:
+        this never writes or adjusts inventory or any other store data.
+        """
+        limit = _clamp_limit(limit)
+        return self._fetch_products(
+            first=limit, after=cursor, query=None, gql=PRODUCTS_INVENTORY_QUERY
+        )
+
     # -- internals ---------------------------------------------------------
 
     def _fetch_products(
-        self, first: int, after: str | None, query: str | None
+        self, first: int, after: str | None, query: str | None,
+        *, gql: str = PRODUCTS_QUERY,
     ) -> dict:
-        """Run the products query and return raw, validated connection data."""
+        """Run a products query and return raw, validated connection data."""
         variables: dict = {"first": first, "after": after, "query": query}
-        payload = self._request(PRODUCTS_QUERY, variables)
+        payload = self._request(gql, variables)
         connection = payload.get("products")
         if not isinstance(connection, dict):
             raise ShopifyUpstreamError("Shopify response missing 'products' node.")
@@ -270,6 +314,33 @@ def normalise_product(node: dict) -> dict:
         "availability": available,
         "total_inventory": total_inventory,
         "variants": variants,
+    }
+
+
+def normalise_inventory_product(node: dict) -> dict:
+    """Map a raw GraphQL product node (inventory query) to the probe shape.
+
+    Null/missing per-variant `inventoryQuantity` values stay None; a null is
+    a data condition, never treated as a permission failure.
+    """
+
+    def _qty(value) -> int | None:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    return {
+        "id": node.get("id"),
+        "title": node.get("title"),
+        "total_inventory": node.get("totalInventory"),
+        "variants": [
+            {
+                "id": v.get("id"),
+                "title": v.get("title"),
+                "sku": v.get("sku"),
+                "inventory_quantity": _qty(v.get("inventoryQuantity")),
+                "available_for_sale": v.get("availableForSale"),
+            }
+            for v in ((node.get("variants") or {}).get("nodes") or [])
+        ],
     }
 
 

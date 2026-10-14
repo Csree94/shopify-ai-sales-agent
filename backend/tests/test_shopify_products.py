@@ -415,6 +415,175 @@ def test_scalar_variant_price_regression(monkeypatch):
     assert product["price_max"] == "25.00"
 
 
+def test_inventory_endpoint_success(monkeypatch):
+    """Phase 6 inventory probe: per-variant quantities returned as integers."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured["variables"] = body["variables"]
+        captured["query"] = body["query"]
+        product = {
+            "id": "gid://shopify/Product/10",
+            "title": "Hat",
+            "totalInventory": 12,
+            "variants": {
+                "nodes": [
+                    {
+                        "id": "gid://shopify/ProductVariant/10",
+                        "title": "Default",
+                        "sku": "SKU-Hat",
+                        "price": "10.00",
+                        "inventoryQuantity": 12,
+                        "availableForSale": True,
+                    }
+                ]
+            },
+        }
+        return httpx.Response(
+            200,
+            json=_gql_response(
+                {"products": {"pageInfo": {"endCursor": "x1", "hasNextPage": True}, "nodes": [product]}}
+            ),
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get("/api/products/inventory?limit=1")
+
+    assert response.status_code == 200
+    # The probe query selects the single step-up scalar.
+    assert "inventoryQuantity" in captured["query"]
+    assert captured["variables"] == {"first": 1, "after": None, "query": None}
+
+    product = response.json()["products"][0]
+    variant = product["variants"][0]
+    assert variant["sku"] == "SKU-Hat"
+    assert variant["inventory_quantity"] == 12
+    # price intentionally absent from the minimal probe shape
+    assert "price" not in variant
+    assert variant["available_for_sale"] is True
+    assert product["total_inventory"] == 12
+    assert response.json()["page_info"] == {"has_next_page": True, "end_cursor": "x1"}
+
+
+def test_inventory_null_and_missing_quantity_stay_null(monkeypatch):
+    """A null/missing quantity is a data condition, not an error or crash."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        product = {
+            "id": "gid://shopify/Product/11",
+            "title": "Nullish",
+            "totalInventory": None,
+            "variants": {
+                "nodes": [
+                    {
+                        "id": "gid://shopify/ProductVariant/11",
+                        "title": "Default",
+                        "sku": None,
+                        "inventoryQuantity": None,
+                        "availableForSale": None,
+                    },
+                    {"id": "gid://shopify/ProductVariant/12", "title": "NoField", "sku": "SKU-12", "availableForSale": False},
+                ]
+            },
+        }
+        return httpx.Response(
+            200,
+            json=_gql_response(
+                {"products": {"pageInfo": {"endCursor": None, "hasNextPage": False}, "nodes": [product]}}
+            ),
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get("/api/products/inventory")
+
+    assert response.status_code == 200
+    products = response.json()["products"]
+    assert products[0]["total_inventory"] is None
+    variants = products[0]["variants"]
+    assert variants[0]["inventory_quantity"] is None
+    assert variants[0]["sku"] is None
+    assert variants[0]["available_for_sale"] is None
+    # Missing field on the second variant also normalises to None, not TypeError.
+    assert variants[1]["inventory_quantity"] is None
+    assert variants[1]["available_for_sale"] is False
+
+
+def test_inventory_pagination_forwards_cursor(monkeypatch):
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["variables"] = json.loads(request.content)["variables"]
+        return httpx.Response(
+            200,
+            json=_gql_response(
+                {"products": {"pageInfo": {"endCursor": "inv9", "hasNextPage": False}, "nodes": []}}
+            ),
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get(
+            "/api/products/inventory", params={"limit": 2, "cursor": "inv0"}
+        )
+
+    assert response.status_code == 200
+    assert captured["variables"] == {"first": 2, "after": "inv0", "query": None}
+    assert response.json()["page_info"] == {"has_next_page": False, "end_cursor": "inv9"}
+
+
+def test_inventory_missing_scope_maps_to_502(monkeypatch):
+    """Access denied on the probe field = read_inventory not granted."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_gql_response(
+                None,
+                errors=[
+                    {"message": "Access denied for inventoryQuantity field. "
+                     "Required access: `read_inventory` access scope."}
+                ],
+            ),
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get("/api/products/inventory")
+
+    assert response.status_code == 502
+    assert "read_inventory" in response.json()["detail"]
+
+
+def test_inventory_auth_failure_maps_to_401(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"errors": "unauthorized"})
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get("/api/products/inventory")
+
+    assert response.status_code == 401
+    assert "fake-token" not in response.text
+
+
 def test_products_use_dynamically_acquired_token(monkeypatch):
     """Client-credentials mode: token endpoint hit first, token header
     injected into the GraphQL call, secret never in any response."""

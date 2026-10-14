@@ -22,6 +22,7 @@ from app.shopify_client import (
     ShopifyThrottledError,
     ShopifyTimeoutError,
     ShopifyUpstreamError,
+    normalise_inventory_product,
     normalise_product,
 )
 
@@ -73,6 +74,29 @@ class PageInfoOut(BaseModel):
 
 class ProductListResponse(BaseModel):
     products: list[ProductOut] = Field(default_factory=list)
+    page_info: PageInfoOut = Field(default_factory=PageInfoOut)
+
+
+# -- inventory probe models (Phase 6) ---------------------------------------
+
+
+class InventoryVariantOut(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    sku: str | None = None
+    inventory_quantity: int | None = None
+    available_for_sale: bool | None = None
+
+
+class InventoryProductOut(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    total_inventory: int | None = None
+    variants: list[InventoryVariantOut] = Field(default_factory=list)
+
+
+class InventoryListResponse(BaseModel):
+    products: list[InventoryProductOut] = Field(default_factory=list)
     page_info: PageInfoOut = Field(default_factory=PageInfoOut)
 
 
@@ -136,4 +160,31 @@ def search_products(
     """Search products with Shopify's `products(query:)` syntax."""
     return _run(
         lambda: get_client().search_products(query=q, limit=limit, cursor=cursor)
+    )
+
+
+@router.get("/products/inventory", response_model=InventoryListResponse)
+def list_inventory(
+    limit: int = Query(5, ge=1, le=250, description="Page size (1-250)."),
+    cursor: str | None = Query(None, description="Opaque page cursor."),
+) -> InventoryListResponse:
+    """Read-only inventory probe (permission test for `read_inventory`).
+
+    Fetches per-variant stock quantities (`inventoryQuantity`) with the same
+    pagination and error handling as the product endpoints. Null quantities
+    are a data condition and never a permission failure; a missing scope
+    surfaces as HTTP 502 with Shopify's own error message.
+    """
+    try:
+        connection = get_client().list_inventory(limit=limit, cursor=cursor)
+    except ShopifyClientError as exc:
+        raise _to_http_exception(exc) from exc
+    nodes = connection.get("nodes") or []
+    page = connection.get("pageInfo") or {}
+    return InventoryListResponse(
+        products=[normalise_inventory_product(node) for node in nodes],
+        page_info=PageInfoOut(
+            has_next_page=bool(page.get("hasNextPage")),
+            end_cursor=page.get("endCursor"),
+        ),
     )

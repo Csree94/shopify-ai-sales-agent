@@ -58,7 +58,7 @@ the app settings — each one is proven with its own request.
 | Scope | Feature that needs it | How we test it individually |
 |---|---|---|
 | `read_products` | Product listing & search (`GET /api/products*`) — Phases 4–5 | Send `GET /api/products?limit=3` against the dev store: expect HTTP 200 with real product titles. If the scope is missing, Shopify returns GraphQL errors we surface as 502 with the message echoed — that failure is the scope test failing. |
-| `read_inventory` | Precise per-location stock for stock-aware sales answers (planned) | Run a minimal GraphQL probe `inventoryItem / inventoryLevel` query once the feature exists; absence shows as a GraphQL error naming the inaccessible field, surfaced as 502. Not required in Phase 5. |
+| `read_inventory` | Per-variant stock quantities for stock-aware sales answers (probe implemented in Phase 6) | Minimal probe implemented: `GET /api/products/inventory?limit=5` (scalar `inventoryQuantity` per variant). Success: HTTP 200 with per-variant integer `inventory_quantity` values. Missing scope: HTTP **502** putting Shopify's own "Access denied… `read_inventory`" message in `detail`. A `null` quantity is a data condition, **not** a permission error. Escalation probe if inconclusive: `inventoryLevel` (the `InventoryLevel` object strictly requires `read_inventory`). |
 | Storefront token scopes (`unauthenticated_read_product_listings`) | Future storefront-facing chat/checkout display | Storefront API probe: `shop { products(first:1) { nodes { title } } }`. Not required in Phase 5; requires `SHOPIFY_STOREFRONT_ACCESS_TOKEN` only when that feature is built. |
 | `write_*` scopes | **None.** The agent is read-only; we will never grant write scopes in this project. | Not applicable — deliberately not requested. |
 
@@ -110,6 +110,26 @@ environment variables always take precedence over file values.
 | Timeout                                   | `504`     | Configurable via `SHOPIFY_HTTP_TIMEOUT_SECONDS`. |
 | Other Shopify/network failures            | `502`     | Unexpected status, API errors, or unusable payload. |
 | Configuration missing/invalid             | —         | Raised as `ConfigurationError` when a client is built; surfaces as a 500 with a named-variable message. |
+
+## Inventory probe test procedure (Phase 6)
+
+`GET /api/products/inventory?limit=5` is a **read-only** permission test for
+`read_inventory`. It reuses product pagination, authentication, and error
+handling, with one added scalar per variant (`inventoryQuantity`).
+
+**Swagger steps:**
+
+1. From `backend/`, run `..\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000`.
+2. Open `http://127.0.0.1:8000/docs`.
+3. Expand **GET /api/products/inventory** → **Try it out** → set `limit` (e.g. `5`) → **Execute**.
+4. Interpret:
+   - `200` with integer `inventory_quantity` values → access to variant stock quantities works.
+   - `200` with `"inventory_quantity": null` → the store returned null/missing values (data condition, not a permission issue).
+   - `502` with an "Access denied…" message naming `read_inventory` → scope not granted; record it in the permission matrix.
+   - `401` → credentials/Direct API access issue (see error table). `429` → throttled; honor `Retry-After`.
+
+The endpoint never writes or adjusts inventory or any other store data: the
+GraphQL operation is a pure `products(...)` read query.
 
 ## Partial GraphQL responses
 
