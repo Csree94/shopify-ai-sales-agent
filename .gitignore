@@ -1,0 +1,38 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# --- Python / virtualenv ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Node / frontend ---
+node_modules/
+dist/
+.vite/
+*.local
+
+# --- Env fixtures / generated test artifacts ---
+tests/fixtures/local_*
+**/.generated/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

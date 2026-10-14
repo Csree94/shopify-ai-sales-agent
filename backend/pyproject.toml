@@ -1,0 +1,9 @@
+[project]
+name = "shopify-ai-sales-agent-backend"
+version = "0.1.0"
+requires-python = ">=3.14"
+
+[tool.pytest.ini_options]
+# Additional import surface for tests: backend/ is set up
+pythonpath = ["."]
+testpaths = ["tests"]
