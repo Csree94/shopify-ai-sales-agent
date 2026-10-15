@@ -121,15 +121,41 @@ handling, with one added scalar per variant (`inventoryQuantity`).
 
 1. From `backend/`, run `..\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000`.
 2. Open `http://127.0.0.1:8000/docs`.
-3. Expand **GET /api/products/inventory** → **Try it out** → set `limit` (e.g. `5`) → **Execute**.
-4. Interpret:
-   - `200` with integer `inventory_quantity` values → access to variant stock quantities works.
-   - `200` with `"inventory_quantity": null` → the store returned null/missing values (data condition, not a permission issue).
-   - `502` with an "Access denied…" message naming `read_inventory` → scope not granted; record it in the permission matrix.
+3. Expand **GET /api/products/inventory** → **Try it out**.
+4. Default mode (`detail=quantities`, Phase 6): set `limit` (e.g. `5`) → **Execute**.
+5. **Strict probe (Phase 7, `detail=levels`):** set `limit=5` and `detail=levels` → **Execute**.
+   This adds the `inventoryItem → inventoryLevels(first: 5) → quantities(names: ["available"])`
+   selection (`InventoryLevel` is documented as requiring `read_inventory`), so
+   the call exercises that scope's field chain directly.
+6. Interpret:
+   - `200` with integer `inventory_quantity` values (default mode) → access to variant stock quantities works.
+   - `200` (`detail=levels`) with `inventory_levels` arrays containing location-level `quantities` (e.g. `{"name": "available", "quantity": 5}`) → **strict probe passes** (record TESTED-PASS in the permission matrix). Note: Shopify returns only *active* levels by default.
+   - `200` (`detail=levels`) with `"inventory_levels": null` (no inventory item, e.g. untracked) or `[]` (chain present, no levels) → data conditions, **not** permission conclusions.
+   - `502` with an "Access denied" message naming `read_inventory` (strict probe) → the `read_inventory` scope is **not granted**; record as TESTED-FAIL in the permission matrix.
    - `401` → credentials/Direct API access issue (see error table). `429` → throttled; honor `Retry-After`.
 
 The endpoint never writes or adjusts inventory or any other store data: the
 GraphQL operation is a pure `products(...)` read query.
+
+### Recorded live result (Phase 7, `detail=levels`)
+
+`GET /api/products/inventory?limit=5&detail=levels` was run from Swagger
+against the real store and returned a successful JSON response: five products,
+location-level quantities on the displayed variants (e.g.
+`{"name": "available", "quantity": 50}`), and `page_info.has_next_page: true`.
+
+- The strict query sent `quantities(names: ["available"])` — the `names`
+  argument is required; the first live run failed with
+  `Field 'quantities' is missing required arguments: names` and the query was
+  corrected (covered by a regression test).
+- The Swagger output did not explicitly display the numeric HTTP status, so
+  the exact status code is not recorded here.
+- **Scope attribution:** the successful strict retrieval matches the query's
+  documented pass condition (`InventoryLevel` is documented as requiring
+  `read_inventory`), which strongly indicates the scope is granted. This is
+  recorded as TESTED-PASS for **strict inventory-level retrieval** and is not
+  presented as independently falsified/confirmed scope verification: the
+  Shopify dashboard's scope display was never used to declare this result.
 
 ## Partial GraphQL responses
 
@@ -149,6 +175,7 @@ Policy:
 
 - Page size is clamped to Shopify's maximum `first: 250`.
 - Variant list capped at `first: 50` per product.
-- Tests are fully mocked (`httpx.MockTransport`); no live calls. **Live
-  connectivity has not been verified yet** — configure a real custom app and
-  run the service against your dev store to confirm end-to-end.
+- Tests are fully mocked (`httpx.MockTransport`); no live calls from pytest.
+  End-to-end store connectivity **has** been demonstrated (live Phase 4/6/7
+  Swagger runs above); the strict `detail=levels` live result is recorded in
+  "Recorded live result" above.

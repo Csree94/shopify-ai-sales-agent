@@ -72,6 +72,33 @@ _INVENTORY_VARIANT_FIELDS = """
   }
 """
 
+# Strict read_inventory probe (Phase 7): the InventoryLevel object is
+# documented as REQUIRING the read_inventory scope, unlike InventoryItem,
+# which read_products can alias. Only active levels are returned by default
+# (Shopify 2026 behaviour).
+_LEVELS_VARIANT_FIELDS = """
+  variants(first: 50) {
+    nodes {
+      id
+      title
+      sku
+      price
+      inventoryQuantity
+      availableForSale
+      inventoryItem {
+        inventoryLevels(first: 5) {
+          nodes {
+            quantities(names: ["available"]) {
+              name
+              quantity
+            }
+          }
+        }
+      }
+    }
+  }
+"""
+
 
 def _products_query(variant_fields: str) -> str:
     """Build the products connection query with the given variant selection."""
@@ -94,6 +121,11 @@ PRODUCTS_QUERY = _products_query(_STANDARD_VARIANT_FIELDS)
 # Query used by the inventory probe endpoint; identical shape to PRODUCTS_QUERY
 # except for the single extra scalar `inventoryQuantity` per variant.
 PRODUCTS_INVENTORY_QUERY = _products_query(_INVENTORY_VARIANT_FIELDS)
+
+# Strict read_inventory probe query (detail=levels); adds the InventoryLevel
+# selection (`inventoryItem -> inventoryLevels -> quantities`) on top of the
+# inventory probe's variant fields.
+PRODUCTS_INVENTORY_LEVELS_QUERY = _products_query(_LEVELS_VARIANT_FIELDS)
 
 
 class ShopifyAdminClient:
@@ -142,17 +174,23 @@ class ShopifyAdminClient:
         limit = _clamp_limit(limit)
         return self._fetch_products(first=limit, after=cursor, query=query.strip())
 
-    def list_inventory(self, limit: int, cursor: str | None = None) -> dict:
+    def list_inventory(
+        self, limit: int, cursor: str | None = None, detail: str = "quantities"
+    ) -> dict:
         """Inventory probe (Phase 6): read-only per-variant stock quantities.
 
-        Reuses the same products connection and pagination with exactly one
-        extra scalar (`inventoryQuantity`) per variant. Strictly read-only:
-        this never writes or adjusts inventory or any other store data.
+        detail="quantities" (default): scalar `inventoryQuantity` per variant.
+        detail="levels" (Phase 7): additionally selects the strict
+        `InventoryLevel` chain (`inventoryItem -> inventoryLevels ->
+        quantities`), whose access requires the `read_inventory` scope.
+        Strictly read-only: this never writes or adjusts any store data.
         """
         limit = _clamp_limit(limit)
-        return self._fetch_products(
-            first=limit, after=cursor, query=None, gql=PRODUCTS_INVENTORY_QUERY
-        )
+        if detail == "levels":
+            gql = PRODUCTS_INVENTORY_LEVELS_QUERY
+        else:
+            gql = PRODUCTS_INVENTORY_QUERY
+        return self._fetch_products(first=limit, after=cursor, query=None, gql=gql)
 
     # -- internals ---------------------------------------------------------
 
@@ -317,16 +355,73 @@ def normalise_product(node: dict) -> dict:
     }
 
 
+def _qty(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _levels_list(variant: dict) -> list[dict] | None:
+    """Validate the inventoryItem -> inventoryLevels chain for one variant.
+
+    Returns None when the item/levels are absent (e.g. untracked inventory);
+    [] when the chain is present but no levels are returned. Data conditions
+    are never folded into permission verdicts in this normaliser.
+    """
+    item = variant.get("inventoryItem")
+    if not isinstance(item, dict):
+        return None
+    levels = item.get("inventoryLevels")
+    if not isinstance(levels, dict):
+        return None
+    nodes = levels.get("nodes")
+    if nodes is None:
+        return None
+    if not isinstance(nodes, list):
+        return None
+    return [
+        {
+            "quantities": [
+                {
+                    "name": entry.get("name"),
+                    "quantity": _qty(entry.get("quantity")),
+                }
+                for entry in ((level or {}).get("quantities") or [] if isinstance(level, dict) else [])
+            ]
+        }
+        for level in nodes
+    ]
+
+
+def normalise_inventory_levels_product(node: dict) -> dict:
+    """Map a raw GraphQL product node (detail=levels probe) to the response.
+
+   inventory_levels is None when Shopify returned no inventory item/levels
+    and [] when the chain is present but empty. Missing/invalid quantity
+    values stay null.
+    """
+    return {
+        "id": node.get("id"),
+        "title": node.get("title"),
+        "total_inventory": node.get("totalInventory"),
+        "variants": [
+            {
+                "id": v.get("id"),
+                "title": v.get("title"),
+                "sku": v.get("sku"),
+                "inventory_quantity": _qty(v.get("inventoryQuantity")),
+                "inventory_levels": _levels_list(v),
+                "available_for_sale": v.get("availableForSale"),
+            }
+            for v in ((node.get("variants") or {}).get("nodes") or [])
+        ],
+    }
+
+
 def normalise_inventory_product(node: dict) -> dict:
-    """Map a raw GraphQL product node (inventory query) to the probe shape.
+    """Map a raw GraphQL product node (default inventory query) to the shape.
 
     Null/missing per-variant `inventoryQuantity` values stay None; a null is
     a data condition, never treated as a permission failure.
     """
-
-    def _qty(value) -> int | None:
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
     return {
         "id": node.get("id"),
         "title": node.get("title"),

@@ -584,6 +584,202 @@ def test_inventory_auth_failure_maps_to_401(monkeypatch):
     assert "fake-token" not in response.text
 
 
+def _levels_node(title: str, quantities: list[dict] | None, with_item: bool = True) -> dict:
+    variant = {
+        "id": f"gid://shopify/ProductVariant/lv-{title}",
+        "title": "Default",
+        "sku": f"SKU-{title}",
+        "price": "10.00",
+        "inventoryQuantity": 7,
+        "availableForSale": True,
+    }
+    if with_item:
+        variant["inventoryItem"] = {
+            "inventoryLevels":{"nodes": ([{"quantities": quantities}] if quantities is not None else [])}
+        }
+    return {
+        "id": f"gid://shopify/Product/lv-{title}",
+        "title": title,
+        "totalInventory": 7,
+        "variants": {"nodes": [variant]},
+    }
+
+
+def _inventory_products_payload(products: list[dict]) -> dict:
+    return {"products": {"pageInfo": {"endCursor": None, "hasNextPage": False}, "nodes": products}}
+
+
+def test_inventory_levels_success(monkeypatch):
+    """Strict read_inventory probe: location-level quantities per variant."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured["query"] = body["query"]
+        captured["variables"] = body["variables"]
+        return httpx.Response(
+            200,
+            json=_gql_response(
+                _inventory_products_payload(
+                    [_levels_node("Hat", [{"name": "available", "quantity": 5}])]
+                )
+            ),
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get(
+            "/api/products/inventory", params={"limit": 1, "detail": "levels"}
+        )
+
+    assert response.status_code == 200
+    assert "inventoryLevels" in captured["query"]
+    # Shopify 2026-10: InventoryLevel.quantities requires the names argument
+    # (regression for the live validation error "Field 'quantities' is missing
+    # required arguments: names").
+    assert "quantities(names: [\"available\"])" in captured["query"]
+    assert "mutation" not in captured["query"].lower()
+    assert captured["variables"] == {"first": 1, "after": None, "query": None}
+
+    variant = response.json()["products"][0]["variants"][0]
+    assert variant["inventory_levels"] == [
+        {"quantities": [{"name": "available", "quantity": 5}]}
+    ]
+    assert variant["inventory_quantity"] == 7
+
+
+def test_inventory_levels_null_and_empty_are_data_conditions(monkeypatch):
+    """None (no item) and [] (chain present, empty) stay data conditions."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nodes = [
+            _levels_node("Untracked", None, with_item=False),
+            _levels_node("NoLevels", None),
+            _levels_node("Stocked", [{"name": "available", "quantity": 3}]),
+        ]
+        # The no-item variant must have no inventoryItem key at all.
+        assert "inventoryItem" not in nodes[0]["variants"]["nodes"][0]
+        return httpx.Response(200, json=_gql_response(_inventory_products_payload(nodes)))
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get(
+            "/api/products/inventory", params={"detail": "levels"}
+        )
+
+    assert response.status_code == 200
+    # Each helper node was a separate product with one variant.
+    products = response.json()["products"]
+    v_untracked = products[0]["variants"][0]
+    v_no_levels = products[1]["variants"][0]
+    v_stocked = products[2]["variants"][0]
+    assert v_untracked["inventory_levels"] is None  # no inventoryItem present
+    assert v_no_levels["inventory_levels"] == []    # chain present, empty levels
+    assert v_stocked["inventory_levels"] == [
+        {"quantities": [{"name": "available", "quantity": 3}]}
+    ]
+
+
+def test_inventory_levels_missing_scope_maps_to_502(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_gql_response(
+                None,
+                errors=[
+                    {"message": "Access denied for inventoryLevels field. "
+                     "Required access: `read_inventory` access scope."}
+                ],
+            ),
+        )
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get(
+            "/api/products/inventory", params={"detail": "levels"}
+        )
+
+    assert response.status_code == 502
+    assert "read_inventory" in response.json()["detail"]
+
+
+def test_inventory_levels_auth_failure_maps_to_401(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"errors": "unauthorized"})
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get(
+            "/api/products/inventory", params={"detail": "levels"}
+        )
+
+    assert response.status_code == 401
+    assert "fake-token" not in response.text
+
+
+def test_default_inventory_behaviour_unchanged_in_levels_mode_off(monkeypatch):
+    """Without detail=levels the endpoint uses the Phase 6 query and shape."""
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured["query"] = body["query"]
+        product = {
+            "id": "gid://shopify/Product/20",
+            "title": "Default",
+            "totalInventory": 4,
+            "variants": {
+                "nodes": [
+                    {"id": "gid://shopify/ProductVariant/20", "title": "Default", "sku": "SKU-20", "price": "5.00", "inventoryQuantity": 4, "availableForSale": True}
+                ]
+            },
+        }
+        return httpx.Response(200, json=_gql_response(_inventory_products_payload([product])))
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get("/api/products/inventory")
+
+    assert response.status_code == 200
+    assert "inventoryQuantity" in captured["query"]
+    assert "inventoryLevels" not in captured["query"]
+    assert "inventoryItem" not in captured["query"]
+    variant = response.json()["products"][0]["variants"][0]
+    assert variant["inventory_quantity"] == 4
+    assert "inventory_levels" not in variant
+
+
+def test_inventory_invalid_detail_rejected(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:  # must never be hit
+        raise AssertionError("no Shopify request expected for invalid detail")
+
+    _install_factory(monkeypatch, _make_client(handler))
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.get(
+            "/api/products/inventory", params={"detail": "write"}
+        )
+
+    assert response.status_code == 422
+
+
 def test_products_use_dynamically_acquired_token(monkeypatch):
     """Client-credentials mode: token endpoint hit first, token header
     injected into the GraphQL call, secret never in any response."""
