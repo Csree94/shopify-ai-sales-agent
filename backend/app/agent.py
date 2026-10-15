@@ -23,8 +23,11 @@ Architecture (approved plan):
 - If both providers fail, one controlled error is raised; the HTTP layer
   maps it to a safe 503. Shopify data stays the only source of truth;
   missing/null data means "unknown", never invented facts.
-- Conversation continuity uses LangGraph's InMemorySaver (in-process,
-  keyed by session_id). No database, no Telegram, no writes.
+- Conversation continuity uses a LangGraph checkpointer keyed by
+  session_id. Phase M1: in-memory by default (unchanged behavior), or
+  Neon PostgreSQL via app.memory_db when NEON_DATABASE_URL is configured
+  (an unreachable configured store is a controlled error, never a silent
+  downgrade). No database writes beyond checkpointing, no Telegram.
 - LangSmith tracing stays OFF (nothing here reads or sets LangSmith env).
 """
 
@@ -37,7 +40,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Callable, TypedDict
 
 from google import genai
-from langgraph.checkpoint.memory import InMemorySaver
+import psycopg
 from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
 
@@ -53,6 +56,7 @@ from app.gemini_client import (
     generate_once,
     make_gemini_client,
 )
+from app.memory_db import MemoryDependencyError, get_checkpointer
 from app.nvidia_client import (
     NvidiaError,
     generate_completion,
@@ -321,9 +325,9 @@ def tools_node(state: AgentState, *, executor: Callable) -> dict:
     }
 
 
-# Module-persistent in-memory memory store: multi-turn conversations survive
-# across run_chat() calls for the same session_id (in-process only, no DB).
-checkpointer = InMemorySaver()
+# Conversation store arrives via app.memory_db.get_checkpointer(): the
+# cached InMemorySaver for local dev/tests, or the Neon-backed PostgresSaver
+# when NEON_DATABASE_URL is configured (seam: memory_db.checkpointer_factory).
 
 
 def build_graph(client, model: str, executor: Callable):
@@ -355,7 +359,7 @@ def build_graph(client, model: str, executor: Callable):
         # trigger another generation attempt — no ungrounded repetition.
         lambda s: "__end__" if s.get("error_kind") else "llm",
     )
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=get_checkpointer())
 
 
 # -- orchestration ------------------------------------------------------------
@@ -390,15 +394,36 @@ def run_chat(message: str, session_id: str) -> ChatOutcome:
     executor = shopify_tool_executor or _tool_functions(
         _shopify_client_for_tools()
     )
-    graph = build_graph(gemini_client, gemini_model, executor)
+    try:
+        graph = build_graph(gemini_client, gemini_model, executor)
 
-    final_state: AgentState = graph.invoke(
-        _new_input(message),
-        config={
-            "configurable": {"thread_id": session_id},
-            "recursion_limit": 2 * MAX_TOOL_LOOPS + 4,
-        },
-    )
+        final_state: AgentState = graph.invoke(
+            _new_input(message),
+            config={
+                "configurable": {"thread_id": session_id},
+                "recursion_limit": 2 * MAX_TOOL_LOOPS + 4,
+            },
+        )
+    except MemoryDependencyError as exc:
+        # The Neon checkpoint store was configured but could not be reached
+        # (connection/schema setup failed): a controlled 503 — never a silent
+        # downgrade to memory (that would invisibly lose persistence), never
+        # a DSN leak.
+        raise ChatAgentError(
+            f"Conversation checkpoint store unavailable: {exc}",
+            fallback_attempted=False,
+        ) from exc
+    except psycopg.Error as exc:
+        # Mid-flight failure of the Neon checkpoint store while the graph was
+        # working (drop, restart, grant revoked, ...): the same controlled
+        # 503 mapping as connection setup. Conversation history stays intact
+        # server-side (checkpoints persist), so nothing is silently lost;
+        # the DSN and connection details are never echoed.
+        raise ChatAgentError(
+            "Conversation checkpoint store unavailable: the configured "
+            "Postgres checkpoint store failed mid-operation (details withheld).",
+            fallback_attempted=False,
+        ) from exc
 
     kind = final_state.get("error_kind", "")
     error_message = final_state.get("error_message", "")

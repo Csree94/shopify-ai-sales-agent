@@ -306,3 +306,46 @@ def _parse_timeout(source: dict[str, str]) -> float:
 def _supported_versions() -> tuple[str, ...]:
     """Stable versions currently served by Shopify (checked 2026-10-14)."""
     return ("2026-01", "2026-04", "2026-07", "2026-10")
+
+
+# -- Phase M1: Neon PostgreSQL (persistent conversation checkpointing) -------
+
+
+@dataclass(frozen=True)
+class NeonSettings:
+    """Validated Neon/PostgreSQL connection settings (Phase M1).
+
+    ``dsn`` comes from ``NEON_DATABASE_URL`` and is a secret — it is never
+    printed, logged, or echoed anywhere (repr/str redact it on purpose).
+    ``agent.memory_db`` builds the checkpoint store from it; without it the
+    app keeps the exact in-memory default.
+    """
+
+    dsn: str
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return "NeonSettings(dsn=<redacted>)"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return "NeonSettings(dsn=<redacted>)"
+
+
+def load_neon_settings(env: dict[str, str] | None = None) -> NeonSettings:
+    """Validate the Neon checkpoint-store DSN (never prints values).
+
+    Returns None when ``NEON_DATABASE_URL`` is unset or a placeholder, which
+    callers turn into in-memory mode (local development / existing tests).
+    """
+    if env is None:
+        load_local_env_files()
+    source = os.environ if env is None else env
+
+    dsn_raw = (source.get("NEON_DATABASE_URL") or "").strip()
+    if not dsn_raw or _looks_like_placeholder(dsn_raw):
+        return None
+    if not dsn_raw.lower().startswith(("postgres://", "postgresql://")):
+        raise ConfigurationError(
+            "NEON_DATABASE_URL must be a postgres:// or postgresql:// "
+            "connection string (value itself is never echoed)."
+        )
+    return NeonSettings(dsn=dsn_raw)

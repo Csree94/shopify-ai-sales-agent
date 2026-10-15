@@ -11,12 +11,15 @@ from __future__ import annotations
 import json
 
 import httpx
+import psycopg
 from fastapi.testclient import TestClient
 
 import app.agent as agent
+import app.memory_db as memory_db
 import app.products as products
 from app.config import ConfigurationError, load_llm_settings
 from app.gemini_client import make_gemini_client
+from langgraph.checkpoint.memory import InMemorySaver
 from app.nvidia_client import make_nvidia_client
 
 # Reuse the Shopify test fixtures of the existing suite.
@@ -910,3 +913,115 @@ def test_missing_gemini_config_surfaces_as_500(monkeypatch):
     with TestClient(fastapi_app) as client:
         response = client.post(CHAT_URL, json={"message": "hi", "session_id": "s-cfg"})
     assert response.status_code == 500
+
+
+def test_checkpointer_seam_used_and_session_state_persists(monkeypatch):
+    """Phase M1 compatibility: run_chat gets its store through the
+    memory_db seam (agent.get_checkpointer), and the SAME session_id
+    accumulates thread state in that one checkpointer instance across
+    turns — with no invented identity merging between sessions.
+    """
+    provided = InMemorySaver()  # a distinct instance the test controls
+    monkeypatch.setattr(agent, "get_checkpointer", lambda: provided)
+    _llm_env(monkeypatch)
+    _install_gemini(
+        monkeypatch,
+        [_g_text("First reply."), _g_text("Second reply remembers the first.")],
+        calls := {},
+    )
+    _install_nvidia(monkeypatch, [], calls)
+    _shopify_factory(monkeypatch, [], calls)
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        r1 = client.post(
+            CHAT_URL,
+            json={"message": "Hello there!", "session_id": "s-mem-1"},
+        )
+        r2 = client.post(
+            CHAT_URL,
+            json={"message": "What did I just ask you?", "session_id": "s-mem-1"},
+        )
+        r3 = client.post(
+            CHAT_URL,
+            json={"message": "What did I just ask you?", "session_id": "s-mem-2"},
+        )
+
+    assert r1.status_code == 200 and r2.status_code == 200 and r3.status_code == 200
+    # InMemorySaver.storage nests thread_id → checkpoint_ns → checkpoint ids.
+    thread_1 = provided.storage["s-mem-1"]
+    thread_2 = provided.storage["s-mem-2"]
+    assert thread_1 and thread_2  # separate keys, no merging
+    namespace = thread_1[""]
+    assert len(namespace) >= 2  # two turns checkpointed under the same thread
+
+
+def test_midflight_neon_failure_maps_to_controlled_503(monkeypatch):
+    """Approved Phase M1 follow-up: a Neon failure WHILE the graph runs
+    (not just at connection setup) maps to the same controlled, sanitized
+    503 — never an unhandled 500, never a silent in-memory downgrade, and
+    the DSN/credentials are never echoed. Conversation history itself
+    stays server-side, so nothing is silently lost.
+    """
+
+    def closing_store():
+        raise psycopg.OperationalError("connection reset by server (fake text)")
+
+    monkeypatch.setattr(agent, "get_checkpointer", closing_store)
+    _llm_env(monkeypatch)
+    _install_gemini(monkeypatch, [], calls := {})
+    _install_nvidia(monkeypatch, [], calls)
+    _shopify_factory(monkeypatch, [], calls)
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.post(
+            CHAT_URL,
+            json={"message": "Hello there!", "session_id": "s-mem-midfail"},
+        )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "checkpoint store" in detail and "mid-operation" in detail
+    # The raw provider text is never echoed.
+    assert "connection reset by server" not in detail
+    assert len(calls["gemini"]) == 0
+    assert len(calls["nvidia"]) == 0
+    assert len(calls["shopify"]) == 0
+
+
+def test_unreachable_checkpoint_store_maps_to_controlled_503(monkeypatch):
+    """Configured-but-unreachable Neon must surface as the controlled 503
+    mapping (not 500, not a silent in-memory downgrade), with a sanitized
+    detail and zero provider/store side traffic.
+    """
+
+    def broken_store():
+        raise memory_db.MemoryDependencyError(
+            "The configured Postgres checkpoint store is unreachable "
+            "(connection or schema setup failed; details withheld)."
+        )
+
+    monkeypatch.setattr(agent, "get_checkpointer", broken_store)
+    _llm_env(monkeypatch)
+    _install_gemini(monkeypatch, [], calls := {})
+    _install_nvidia(monkeypatch, [], calls)
+    _shopify_factory(monkeypatch, [], calls)
+
+    from app.main import app as fastapi_app
+
+    with TestClient(fastapi_app) as client:
+        response = client.post(
+            CHAT_URL,
+            json={"message": "Hello there!", "session_id": "s-mem-db-down"},
+        )
+
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "checkpoint store unavailable" in detail
+    # Nothing else ran: no providers, no Shopify, no fallback temptation.
+    assert len(calls["gemini"]) == 0
+    assert len(calls["nvidia"]) == 0
+    assert len(calls["shopify"]) == 0
