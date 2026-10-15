@@ -6,8 +6,10 @@
 > **user-reported facts** and **planned/NOT TESTED items** — do not inflate them.
 
 Created: 2026-10 (during the Phase 7 review round).
-Updated: Phase 7 live `detail=levels` result recorded (successful strict probe,
-with the documented scope-attribution caveat).
+Updated: Phase 8 (Gemini/LangGraph sales agent + NVIDIA fallback) and Phase M1
+(Neon-backed persistent conversation memory) are IMPLEMENTED, TESTED, and
+PUSHED (`e8ca2ae` on `origin/main`). Telegram integration is the next planned
+phase (see §8/§11 for the exact continuation prompt).
 Repository: `C:\Users\harik\Desktop\Sree_new\shopify-ai-sales-agent`
 Remote: `https://github.com/Csree94/shopify-ai-sales-agent.git`
 
@@ -16,22 +18,26 @@ Remote: `https://github.com/Csree94/shopify-ai-sales-agent.git`
 ## 1. Project overview
 
 **What it is.** Project 2 is a Shopify "AI Sales Agent": a Python backend that
-talks to a Shopify store on the user's behalf (product listing, search, and —
-being phased in — inventory awareness), built so that later phases can connect
-an LLM, a chat surface (Telegram), and a checkout flow. The frontend is a
-React + TypeScript + Vite scaffold. The immediate technical goal through
-Phase 7 has been a solid, tested, permission-aware foundation: authentication,
-read-only product retrieval, and individually proven Shopify API permissions.
+talks to a Shopify store on the user's behalf (read-only product listing,
+search, inventory), an LLM chat service (LangGraph agent with a Gemini
+primary model and an NVIDIA Nemotron generation-only fallback), a FastAPI chat
+surface (`POST /api/chat`), and persistent per-session conversation memory in
+Neon PostgreSQL. The frontend is a React + TypeScript + Vite scaffold (still
+bare). Still **not** implemented: Telegram chat surface, FAQ/policy retrieval
+(RAG), proactive product recommendations, a checkout flow, admin dashboard,
+caching/limiting, deployment.
 
 **User-facing goals (per the plan).** An AI assistant that can answer customer
 questions about products (name, description, price, variants, SKU,
-availability, eventually location-level stock), suggest products, and support
-checkout-related flows through a Telegram chat surface and an admin dashboard.
-None of the chat/LLM/checkout/dashboard parts are implemented yet.
+availability), suggest products, and support checkout-related flows through a
+Telegram chat surface and an admin dashboard. Chat answering from store data
+is **implemented live-verified**; the remaining surfaces are not.
 
 **Technologies.**
-- Backend: Python (venv at repo root `.venv\`), FastAPI, pydantic,
-  [httpx](https://www.python-httpx.org) (with `MockTransport` for all tests),
+- Backend: Python (venv at repo root `.venv\`), FastAPI, pydantic, LangGraph
+  (state graph + checkpointer), `google-genai` (Gemini), `openai` client
+  (NVIDIA), [httpx](https://www.python-httpx.org) (with `MockTransport` for
+  all tests), `psycopg` 3 + `langgraph-checkpoint-postgres` (Neon memory),
   `python-dotenv` (silent `.env` loading), pytest.
 - Shopify access: **GraphQL Admin API only, version `2026-10`** (latest stable).
   The REST Admin API is legacy per Shopify and was announced to stop serving
@@ -43,8 +49,11 @@ None of the chat/LLM/checkout/dashboard parts are implemented yet.
 
 **Project boundaries (must not be crossed).**
 - This is **Project 2 — the Shopify AI Sales Agent only**.
-- Project 1 and the **Inventra** project are separate repositories. Never open,
-  modify, or integrate them into Project 2, and never copy code between them.
+- Project 1 and the **Inventra** project are separate repositories. **Boundary
+  update (user-approved):** inspecting Inventra **read-only** is now the
+  sanctioned next task (to find reusable Telegram integration code — see §8),
+  but Inventra must still never be modified, and copying code into Project 2
+  requires the user's explicit approval and clean adaptation.
 - All Shopify operations are strictly **read-only**. No `write_*` scopes are
   granted and none will be requested.
 
@@ -82,9 +91,15 @@ environment variables always win; values are never printed):
   `SHOPIFY_API_VERSION` (default `2026-10`),
   `SHOPIFY_HTTP_TIMEOUT_SECONDS` (default 15, max 60),
   `SHOPIFY_STOREFRONT_ACCESS_TOKEN` (present as a placeholder only; unused).
-- Future features (placeholders exist, nothing read them yet):
-  `GEMINI_API_KEY` (LLM), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`,
-  `DATABASE_URL` (do not provision without approval), `REDIS_URL`.
+- LLM (Phase 8 — now actively read): `GEMINI_API_KEY`,
+  `GEMINI_MODEL` (default `gemini-3.6-flash`; see §9(10) — sampling params
+  must never be sent), `NVIDIA_API_KEY`, `NVIDIA_LLM_MODEL`
+  (`nvidia/nemotron-3-ultra-550b-a55b`), `NVIDIA_LLM_BASE_URL`
+  (`https://integrate.api.nvidia.com/v1`), `LLM_FALLBACK_ENABLED`.
+- Memory (Phase M1 — now actively read): `NEON_DATABASE_URL` (postgres:// DSN;
+  unset/placeholder → in-memory mode; setup steps in `.env.example`).
+- Still future (placeholders exist, nothing reads them yet):
+  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `DATABASE_URL`, `REDIS_URL`.
 
 **Editor instructions are** `backend/docs/shopify-setup.md` (**auth modes,
 required scopes, permission-test procedures**). That file is the source of
@@ -94,55 +109,96 @@ truth for Shopify config; this handover supplements it with project history.
 
 ## 3. Architecture and implementation
 
-**Backend layout.**
-- `backend/app/main.py` — FastAPI entrypoint; registers the products router;
-  `GET /health` (contract frozen since Phase 1).
-- `backend/app/config.py` — `ShopifySettings` loaded **per call** from
-  environment (not import time), so tests inject env dicts. Validations:
-  myshopify-domain normalisation, supported API-version list
-  (`2026-01 … 2026-10`, latest `2026-10`), timeout bounds, auth credentials.
-  `auth_mode` = `client_credentials` (when client id+secret are set) or
-  `static_token`; client credentials take precedence, and placeholder-looking
-  static tokens never silently override them. The dataclass `repr` redacts all
-  credential fields.
-- `backend/app/shopify_auth.py` — `ShopifyTokenManager`:
-  - client-credentials grant → `POST https://{store}/admin/oauth/access_token`
-    with form fields `grant_type=client_credentials`, `client_id`,
-    `client_secret` (officially documented flow; verified against shopify.dev);
-  - tokens valid ≈ 24 h (`expires_in` ≈ 86399), cached in memory (thread-safe
-    lock), refreshed **proactively 300 s before expiry**, and invalidated after
-    any upstream 401 (next call re-authenticates; no in-request auto-retry);
-  - secrets only ever travel in request headers/bodies; nothing is logged.
+**Phase 1–7 core (stable, fully preserved):**
+- `backend/app/main.py` — FastAPI entrypoint; registers the products and chat
+  routers; `GET /health` (contract frozen since Phase 1).
+- `backend/app/config.py` — per-call settings loading (`ShopifySettings`,
+  `LLMSettings`, `NeonSettings` + loaders inject env dicts for tests).
+  Validations: myshopify-domain normalisation, supported API-version list,
+  timeout bounds, auth credentials, DSN scheme; `auth_mode` =
+  `client_credentials` over `static_token`; placeholder-looking values
+  (contain `placeholder`, start `your_`, or the known webhook placeholder)
+  are treated as unset. **All credential-bearing reprs are redacted**
+  (`NeonSettings(dsn=<redacted>)`, LLM keys redacted) — never fetch/print
+  secrets; nothing is logged.
+- `backend/app/shopify_auth.py` — `ShopifyTokenManager`: client-credentials
+  grant, ≈24 h tokens cached in memory (thread-safe lock), proactively
+  refreshed 300 s before expiry, invalidated after any 401 (no in-request
+  auto-retry); secrets only in headers/bodies, never logged.
 - `backend/app/shopify_errors.py` — shared exception hierarchy
   (`ShopifyAuthError`, `ShopifyThrottledError` (+ `retry_after`),
   `ShopifyTimeoutError`, `ShopifyUpstreamError`).
-- `backend/app/shopify_client.py` — read-only GraphQL client over
-  `https://{store}/admin/api/{version}/graphql.json`:
-  - `list_products`, `search_products` (Shopify `products(query:)` syntax),
-    `list_inventory(limit, cursor, detail="quantities"|"levels")`;
-  - typed error translation: HTTP 401/403 → auth, GraphQL `THROTTLED` or
-    HTTP 429 → throttle (+ `Retry-After` parsed, unused values dropped),
-    timeouts → 504, everything else/parse issues/GraphQL errors → 502;
-  - **any GraphQL `errors` array rejects the whole response** (no partial
-    results are served as complete — fixed query shape means silently missing
-    fields cannot be distinguished from empty ones);
-  - product normalisation; **`ProductVariant.price` is the scalar `Money`**
-    type (a monetary string); currency comes from `priceRange` (`MoneyV2`).
-- `backend/app/products.py` — routes (see §3 routes) + pydantic response
-  models + HTTP error mapping.
+- `backend/app/shopify_client.py` — read-only GraphQL client:
+  `list_products`, `search_products`, `list_inventory(detail="quantities"|"levels")`;
+  typed error translation (401/403 auth, 429/THROTTLED throttle + Retry-After,
+  timeouts → 504, everything else → 502); **any GraphQL `errors` array rejects
+  the whole response** (no partial results served as complete);
+  `ProductVariant.price` is the scalar `Money` string, currency from
+  `priceRange` (`MoneyV2`).
+- `backend/app/products.py` — read-only routes + pydantic models + HTTP error
+  mapping.
+
+**Phase 8 (LLM sales agent):**
+- `backend/app/gemini_client.py` — one `genai.Client` per turn from validated
+  settings; `generate_once()` does exactly ONE API round-trip; automatic
+  function calling is disabled (the agent executes tools itself). Request
+  compliance fixes (verified against Google's official docs and the installed
+  SDK source): **no sampling parameters ever sent** (deprecated for 3.6-flash
+  and all later models), `thought_signature` values returned by Gemini are
+  captured and **replayed verbatim** on subsequent model calls (Gemini 3.x
+  baseline), `HttpOptions.timeout` is milliseconds (seconds converted once),
+  and `HttpRetryOptions(attempts=1)` pins the no-auto-retry rule. Errors are
+  translated to typed classes via HTTP status: 429/5xx/timeout →
+  fallback-eligible; 401/403, other 4xx (incl. **HTTP 499 `CANCELLED`**),
+  safety refusals, network/parse errors → not eligible. 4xx messages include
+  the SDK's structured `status`/one-line `message` (sanitized; the full body
+  `.details` is never read).
+- `backend/app/agent.py` — LangGraph state graph (`llm` ↔ `tools`,
+  `recursion_limit`, `InMemorySaver`-compatible checkpointing via
+  `get_checkpointer()`): each turn passes ONLY the new user message;
+  `verified_context` accumulates validated Shopify tool results
+  (`search_catalog`, `product_stock` — exactly two read-only tools; each
+  Shopify query runs at most once per turn). Fallback gates: eligible Gemini
+  failure + fallback enabled + NVIDIA key + **verified Shopify context**.
+  Approved addition: when Gemini fails BEFORE tool selection on an explicit
+  `SKU-…`/`sku:` reference, ONE deterministic read-only lookup grounds the
+  fallback (never the same lookup twice; never any invented product data).
+  Fallback outcome is generation-only Nemotron over the verified context.
+- `backend/app/chat.py` — `POST /api/chat` contract: 200
+  `{reply, session_id, tools_used, model_used, fallback_used}`; 400 empty
+  message; 500 config; 503 controlled provider/store failures (with sanitized
+  gate reason categories); Shopify tool failures keep their exact
+  401/429/502/504 mapping.
+- `backend/app/nvidia_client.py` — OpenAI-compatible NVIDIA client
+  (`max_retries=0`), generation-only (no tools), same never-invent rules.
+
+**Phase M1 (persistent conversation memory):**
+- `backend/app/memory_db.py` — `get_checkpointer()`: when `NEON_DATABASE_URL`
+  is configured, the official `PostgresSaver` (`langgraph-checkpoint-postgres`)
+  over ONE source-verified thread-safe long-lived psycopg3 connection
+  (options mirror `from_conn_string`: `autocommit=True`,
+  `prepare_threshold=0`, `row_factory=dict_row`) with **once-only idempotent
+  `setup()`** under a start lock; unconfigured → the cached `InMemorySaver`
+  (exact pre-M1 behavior). A configured-but-unreachable store raises
+  `MemoryDependencyError` → controlled 503 — **never a silent downgrade**;
+  mid-operation store failures (`psycopg.Error`) map to the same 503.
+- Test isolation: `backend/tests/conftest.py` — autouse fixture pins every
+  test to in-memory mode (never reads the real DSN, never connects to Neon)
+  with explicit fake-Neon stubs only where documented.
 
 **Frontend.** Initial React+TS+Vite scaffold only (`frontend/src/App.tsx`,
 hero image, oxlint config). No API integration on the frontend yet. Tests:
 backend-only (pytest); frontend verified via `npm run build`.
 
-**Routes (all read-only):**
+**Routes:**
 | Route | Status | Since |
 |---|---|---|
 | `GET /health` | implemented (contract frozen) | Phase 1 commit |
 | `GET /api/products` (`limit`, `cursor`) | implemented + live-tested | Phase 4 |
 | `GET /api/products/search?q=` | implemented (same pagination) | Phase 4 |
-| `GET /api/products/inventory?limit&cursor&detail` | implemented (`detail=quantities` default; `detail=levels` = strict `read_inventory` probe, now sending `quantities(names: ["available"])`) | Phase 6/7 (**live strictly-probed result: PASS — see §5/§6**) |
-| Checkout / Telegram / RAG / LLM / dashboard / DB | not implemented | planned |
+| `GET /api/products/inventory?limit&cursor&detail` | implemented (`detail=quantities` default; `detail=levels` = strict `read_inventory` probe, sending `quantities(names: ["available"])`) | Phase 6/7 (live strict probe: PASS, see §5/§6) |
+| `POST /api/chat` | implemented; live-verified end-to-end (see §5) | Phase 8 (memory M1) |
+| Checkout / Telegram / RAG / docs-retrieval / recommendations / dashboard | not implemented | planned (§8) |
 
 **API boundary rules (important).**
 - Admin API = `https://{store}.myshopify.com/admin/api/{v}/graphql.json` with
@@ -160,8 +216,8 @@ everything), `read_inventory` (probe phase), storefront scopes (future). No
 
 ## 4. Completed phases and commits
 
-All four commits below are **verified pushed to `origin/main`** (local HEAD ==
-origin/main checked after each push; fast-forward only).
+All commits below are **verified pushed to `origin/main`** (local HEAD ==
+origin/main checked after each push; fast-forward only; no force-push ever).
 
 | Commit | Message | Phase | Suite at that commit |
 |---|---|---|---|
@@ -169,73 +225,57 @@ origin/main checked after each push; fast-forward only).
 | `5cd3ae6` | `feat: add Shopify product retrieval API` | Phase 4: GraphQL product listing/search, pagination, typed errors | 22 tests |
 | `6b3688e` | `feat: add Shopify authentication and fix product query` | Phase 5: client-credentials auth + token refresh; silent `.env` loading; scalar-`Money` price fix | 39 tests |
 | `ffa908f` | `feat: add read-only Shopify inventory endpoint` | Phase 6: `GET /api/products/inventory` (`inventoryQuantity` scalar) | 44 tests |
-
-**Uncommitted work (Phase 7, in progress — do NOT invent a commit for it):**
-- Modified, uncommitted files: `backend/app/products.py`,
-  `backend/app/shopify_client.py`, `backend/docs/shopify-setup.md`,
-  `backend/tests/test_shopify_products.py`.
-- Content: strict `read_inventory` probe via `detail=levels` on the inventory
-  endpoint
-  (`inventoryItem → inventoryLevels(first:5) → quantities(names:["available"]){name,quantity}`),
-  response-model split, docs update, 6 new mocked tests + the `names` fix
-  regression assertion.
-- Suite at this state: **50 passed** (`pytest -q` re-run at the fixed state, no
-  cache side-effects), `pip check` clean, `git diff --check` clean.
-- Live progress during the Phase 7 round [user-reported]: the first live run
-  failed with Shopify's validation error
-  `Field 'quantities' is missing required arguments: names`; the query was
-  corrected to send `names: ["available"]` and the **second live run
-  succeeded: five products with location-level quantities
-  (e.g. `{"name": "available", "quantity": 50}`) and
-  `page_info.has_next_page: true`** (the exact HTTP status code was not
-  displayed and is not recorded). See §5/§6.
-- Work stopped at: **awaiting review + explicit approval to commit the Phase 7
-  changes**. Do not commit/push without the verification checklist in §9(8).
-  See §7/§8.
+| `1b1420d` | `feat: add strict read_inventory levels probe` | Phase 7: `detail=levels` strict inventory chain, response split, docs, 6 new mocked tests + `names` regression | 50 tests |
+| `88bfa4c` | `Complete Phase 8 LangGraph sales agent` | Phase 8: Gemini 3.6-flash primary (no sampling params, thought-signature replay, sanitized structured 4xx diagnostics), read-only Shopify tool grounding, gated generation-only NVIDIA Nemotron fallback incl. approved deterministic SKU retrieval, HTTP 499 CANCELLED non-retryable policy + test | 108 tests |
+| `e8ca2ae` | `Add Neon persistent conversation memory` | Phase M1: Neon-backed PostgresSaver checkpointer (pinned `langgraph-checkpoint-postgres==3.2.0`), in-memory fallback, no-silent-downgrade error mapping, mid-operation failure mapping, `.env.example` Neon docs with corrected table grants, test-isolation fixture | 120 tests |
 
 ---
 
 ## 5. Live testing evidence
 
-Legend: **[verified by agent]** = reproduced by me through outputs I obtained;
-**[user-reported]** = performed by the user on their real store; **[mocked]** =
-`httpx.MockTransport`, no network.
+Legend: **[verified by agent]** = reproduced through outputs the agent obtained;
+**[user-reported]** = performed by the user on their real store/services;
+**[mocked]** = `httpx.MockTransport`, no network.
 
-- **Phase 4/5 — product retrieval: **GET /api/products?limit=3`` returned real
+- **Phase 4/5 — product retrieval:** `GET /api/products?limit=3` returned real
   Shopify product data. [user-reported] First live attempt (during Phase 5)
-  exposed an invalid nested selection on `ProductVariant.price`
-  (`Selections can't be made on scalars (field 'price' returns Money ……)`);
-  this was fixed to the bare scalar `price` and the user confirmed a successful
-  retry. That exact error is preserved in a regression test. [verified by agent, mocked]
-- **Phase 6 — inventory quantity probe: **GET /api/products/inventory?limit=5``
-  returned HTTP 200 with real product and variant inventory quantities.
-  [user-reported] Example structure (from the response contract):
-  `{"products":[{"title":…,"total_inventory":…,"variants":[{"sku":…,
-  "inventory_quantity":<int>,…}]}],"page_info":{…}}`.
-  ⚠ Scope caveat: success proves the query/schema work, but `inventoryQuantity`
-  may be `read_products`-gated — see §6 for why `detail=levels` is required to
-  prove `read_inventory` itself.
+  exposed an invalid nested selection on `ProductVariant.price` (`Selections
+  can't be made on scalars (field 'price' returns Money …)`); fixed to the
+  bare scalar `price`; user confirmed a successful retry; preserved in a
+  regression test. [verified by agent, mocked]
+- **Phase 6 — inventory quantity probe:** `GET /api/products/inventory?limit=5`
+  returned HTTP 200 with real per-variant quantities. [user-reported]
+  ⚠ Scope caveat: `inventoryQuantity` may be `read_products`-gated — see §6.
 - **Phase 7 — `detail=levels` strict probe: TESTED-PASS (live).** [user-reported]
-  - First live attempt failed with Shopify's own validation error (verbatim,
-    do not lose it):
-    `Shopify API errors: Field 'quantities' is missing required arguments: names`.
-    This was a schema-argument problem, not a permission verdict — the query
-    was confirmed against shopify.dev (`InventoryLevel.quantities` requires
-    `names: [String!]!`) and fixed to `quantities(names: ["available"])`,
-    matching the Phase 5 query-fix pattern. The sent-argument shape is now
-    asserted by the `test_inventory_levels_success` regression test.
-  - Second live attempt: `GET /api/products/inventory?limit=5&detail=levels`
-    returned a successful JSON response: five products, location-level
-    quantities on the displayed variants including `name: "available"` with
-    `quantity: 50`, and `page_info.has_next_page: true`. The surfaced output
-    did not explicitly display the numeric HTTP status code; it is therefore
-    not recorded rather than guessed.
-- **Auth/token flow:** client-credentials token acquisition has passed all
-  mocked tests (including expiry-margin refresh and 401-invalidation) and is
-  exercised by every live request the user made above; no separate live
-  token-lifecycle observation has been made.
-- All **50** current backend tests are fully mocked; no test touches the live
-  store. Run `pytest` anytime — it never sends traffic.
+  First attempt failed with `Field 'quantities' is missing required arguments:
+  names`; fixed to `quantities(names: ["available"])` + regression test;
+  second attempt returned five products with location-level quantities
+  (e.g. `{"name": "available", "quantity": 50}`), `has_next_page: true`
+  (HTTP status not displayed, not recorded). Scope-attribution caveat in §6.
+- **Phase 8 — chat agent (one approved live request + user-side run):**
+  - The approved live `POST /api/chat` (SKU-Hat question) returned **HTTP 200**
+    with `fallback_used: true`, `model_used: nvidia/nemotron-3-ultra-550b-a55b`,
+    `tools_used: ["search_catalog", "product_stock"]` — Gemini executed both
+    Shopify tools, a later Gemini step failed (eligible class), and the fallback
+    answered **grounded** in verified store data. [verified by agent]
+  - The answer honestly declined SKU-Hat details that were NOT in the verified
+    store data (never-invent rule working as approved). Whether the real store
+    carries `SKU-Hat` remains unconfirmed store-datum — not a code question.
+  - Earlier live rounds observed Gemini provider-side failures: HTTP 503
+    (native Google error payload) and HTTP 499 `CANCELLED`; both are classified
+    correctly (503 → fallback-eligible; 499 → non-retryable, now pinned by a
+    test). [verified by agent via sanitized detail strings]
+- **Phase M1 — Neon persistence: verified live across a backend restart.**
+  [user-reported] With a real `NEON_DATABASE_URL` configured, the checkpoint
+  tables were created on first use and conversation state survived a FastAPI
+  restart (same session). The offline suite exercises the same code paths with
+  stubs only.
+- **Auth/token flow:** client-credentials token acquisition passed all mocked
+  tests and is exercised by every live store request above; no separate
+  live token-lifecycle observation has been made.
+- **All 120 current backend tests are fully mocked/offline.** No automated
+  test touches the live store, Neon, Gemini, or NVIDIA (enforced by
+  `backend/tests/conftest.py`). Run `pytest` anytime — it never sends traffic.
 
 ---
 
@@ -245,10 +285,10 @@ Legend: **[verified by agent]** = reproduced by me through outputs I obtained;
 |---|---|---|---|---|---|
 | `read_products` | Product listing + search (+ price/variant/SKU data) | Yes (Phases 4–5) | Live `GET /api/products?limit=3` through FastAPI/Swagger | **TESTED-PASS** [user-reported] | None known; all fields returned |
 | `inventoryQuantity` fields (scalar quantities per variant) | Inventory-aware availability in answers | Yes (Phase 6) | Live `GET /api/products/inventory?limit=5` | **TESTED-PASS** [user-reported] | ⚠ Which scope gates this field is not publicly unambiguous (`read_products` vs `read_inventory`); success does **not** independently prove `read_inventory` |
-| `read_inventory` (strict, `InventoryLevel`) | Location-level stock (planned stock-aware feature) | Probe implemented (Phase 7), feature not built | Live Swagger `GET /api/products/inventory?limit=5&detail=levels` (after the `names` query fix) | **TESTED-PASS — strict retrieval** [user-reported]: 5 products with location-level quantities (e.g. `{"name":"available","quantity":50}`), `has_next_page: true`; HTTP status not explicitly displayed, not recorded | **Scope-attribution caveat:** shopify.dev documents `InventoryLevel` as requiring `read_inventory`, so the successful strict chain strongly indicates the scope is granted — but this is not framed as definitive, independently falsified/confirmed scope verification (docs were read at snippet level per §9(5), and the Shopify dashboard's scope list was never used to declare a result). Null/empty `inventory_levels` would have been data conditions, not scope verdicts; that case never arose. |
-| `read_inventory` (legacy fields e.g. `quantityAvailable`) | Fallback knowledge | n/a | documented only | NOT TESTED | Legacy fields are reportedly tied to `read_inventory` per shopify.dev; we did not rely on them |
-| Storefront `unauthenticated_read_product_listings` + `SHOPIFY_STOREFRONT_ACCESS_TOKEN` | Future storefront-facing display | No | Storefront GraphQL probe (`/api/{v}/graphql.json`) — **not planned until the feature exists** | NOT TESTED | Requires creating a storefront token (an app-config change → user approval first) |
-| `write_*` scopes | Product/order mutation | **Never** — agent is read-only | not applicable (never requested) | Deliberately excluded | — |
+| `read_inventory` (strict, `InventoryLevel`) | Location-level stock (planned stock-aware feature) | Probe implemented (Phase 7), feature not built | Live Swagger `GET /api/products/inventory?limit=5&detail=levels` (after the `names` query fix) | **TESTED-PASS — strict retrieval** [user-reported]: 5 products with location-level quantities (e.g. `{"name":"available","quantity":50}`), `has_next_page: true`; HTTP status not displayed, not recorded | **Scope-attribution caveat:** shopify.dev documents `InventoryLevel` as requiring `read_inventory`, so the strict chain strongly indicates the grant — but this is not framed as definitive, independently falsified/confirmed scope verification (per §9(11), dashboard scope lists were never used to declare a result). Null/empty `inventory_levels` are data conditions, not scope verdicts; that case never arose. |
+| `read_inventory` (legacy fields e.g. `quantityAvailable`) | Fallback knowledge | n/a | documented only | NOT TESTED | We never relied on them |
+| Storefront `unauthenticated_read_product_listings` + `SHOPIFY_STOREFRONT_ACCESS_TOKEN` | Future storefront-facing display | No | Storefront GraphQL probe (`/api/{v}/graphql.json`) — **not planned until the feature exists** | NOT TESTED | Requires creating a storefront token (app-config change → user approval first) |
+| `write_*` scopes | Product/order mutation | **Never** — agent is read-only | not applicable | Deliberately excluded | — |
 
 **Key distinction (teacher's requirement):** scopes shown in the Shopify
 dashboard are *claims*; a scope is only *proven* when the specific read
@@ -259,119 +299,247 @@ declare a result in any row above.
 
 ## 7. Current project state (verified at handover time)
 
-- **Branch:** `main`. **HEAD:** `ffa908f`
-  (`ffa909bd…` full: `ffa908fce099e43466b8f05e3fb924d339936095` at last check;
-  = `origin/main`).
-- **Working tree:** NOT clean — Phase 7 is uncommitted (4 modified files
-  listed in §4, including the `names` query fix + regression test; plus the
-  doc updates recorded this round). **Nothing staged.** Nothing unexpected
-  tracked; `docs/PROJECT_HANDOVER.md` itself is still untracked (`?? docs/`).
-- **Tests:** 50 passed, 0 failed; `pip check` clean (both re-verified from the
-  `backend/` directory at handover time).
-- **`backend/.env`:** exists with real-looking domain + client credentials
-  (presence verified heuristically only — values never displayed) and
-  git-ignored (`.gitignore` pattern `.env`), never staged or tracked.
-- **Exact stop point:** Phase 7 code + docs + tests are complete and passing,
-  and the **live `detail=levels` Swagger test has now succeeded** (§5/§6,
-  including the corrected `quantities(names: ["available"])` query). The docs
-  now record that result with the explicit retrieval-vs-scope-attribution
-  distinction. The very next action is **review + commit of the Phase 7
-  changes — only on the user's explicit instruction** (§9(8)); no live store
-  request is pending.
+- **Branch:** `main`. **HEAD:** `e8ca2ae` (`Add Neon persistent conversation
+  memory`) = `origin/main`; full log verified this round:
+  `b6d6280` → `5cd3ae6` → `6b3688e` → `ffa908f` → `1b1420d` → `88bfa4c` →
+  `e8ca2ae`.
+- **Working tree:** clean ("nothing to commit"); nothing staged; Phase 8 and
+  Phase M1 are fully committed AND pushed.
+- **Tests:** 120 passed, 0 failed; `pip check` clean; `git diff --check`
+  clean (all re-verified immediately before the M1 push and again this round
+  via `pip check`).
+- **`backend/.env`:** exists with real-looking domain/client credentials and
+  (since M1) a real `NEON_DATABASE_URL` (real live connection proven; values
+  never inspected or displayed; git-ignored, never staged/tracked).
+- **Exact stop point:** all committed work is pushed. The next task (§8) is
+  the Telegram phase: read-only inspection of the Inventra project for
+  reusable integration code, then connecting Telegram to the existing agent.
+  Nothing of that is started.
 
 ---
 
 ## 8. Pending work and recommended order
 
-**Immediate next actions (in order).**
-1. ~~User runs the live strict probe~~ **DONE.** Result recorded in §5/§6:
-   first run failed on the (then-required) missing `names` argument; after the
-   one-line query fix and a regression test, the live run passed. Remaining
-   homework from it: record the outcome in `backend/docs/shopify-setup.md`
-   (done in this documentation round).
-2. **Review + commit the Phase 7 changes** (4 code/test files + 2 doc files,
-   plus `docs/PROJECT_HANDOVER.md` if desired) with a message such as
-   `feat: add strict read_inventory levels probe` — **only when the user
-   explicitly asks**, after full pytest + `pip check` + staged-diff secret
-   scan; verify HEAD == origin/main afterwards.
-3. Phase 8 (planned): Telegram integration or LLM integration (per the
-   teacher's plan) — still requiring the sales-agent chat design.
+**Immediate next task (user-approved plan).**
+1. **Inventra inspection (read-only).** Locate the earlier Inventra project on
+   the user's machine (ask for its path if not obvious), read its Telegram
+   integration code read-only, and report what is actually implemented vs
+   assumed — do **not** assume Inventra's Telegram code is complete or working
+   until inspected. No code copying without the user's explicit approval and
+   clean adaptation (token/webhook-secret env names must map to
+   `TELEGRAM_BOT_TOKEN` / `TELEGRAM_WEBHOOK_SECRET`).
+2. **Connect Telegram to the existing agent.** Chat surface over the existing
+   `run_chat()` result contract (`reply`, `session_id`, `fallback_used`…);
+   map provider errors to safe Telegram messages; webhook verification per
+   Telegram rules; long polling vs webhook to be decided with the user.
+   Secrets handled exactly like every other env var (never printed/staged).
 
-**Remaining permission/verification work.**
-- ~~Record `detail=levels` outcome in the matrix (§6).~~ **Done** — recorded
-  as TESTED-PASS (strict retrieval) with the scope-attribution caveat kept
-  explicit.
-- Later, when features exist: per-location inventory feature (using proven
-  `read_inventory` results), storefront token + probe (needs user-approved
-  token creation), LLM scope check (`GEMINI_API_KEY` usage), Telegram webhook
-  secret handling.
+**Then (planned order after checking the teacher's actual specification):**
+FAQs/policy retrieval (semantic memory / RAG — Neon + embeddings), product
+recommendations, remaining frontend work, security hardening, caching/limiting
+(`REDIS_URL` placeholder), admin dashboard/WebSocket, deployment, and testing
+requirements. Confirm each against the teacher's actual specification before
+building; do not self-invent requirements.
 
-**Feature backlog (not started).** Telegram integration, RAG product-search
-grounding, LLM answer generation (`GEMINI_API_KEY` button already pinned in
-`requirements.txt` as `google-genai`), checkout flow (likely Storefront API;
-read-only or the teacher's decision), admin dashboard, database persistence
-(`psycopg` pinned but unused), security hardening, rate limiting.
+**Feature backlog (verified-not-started).** Telegram integration (next),
+FAQ/policy retrieval, product recommendations, checkout flow (likely
+Storefront API; read-only or the teacher's decision), admin dashboard,
+security hardening, rate limiting, deployment.
 
 **Optional improvements (nice-to-have).**
-- Request-lifetime Shopify client/token-manager singleton (currently a fresh
-  `httpx` client per request; fine at current scale).
-- Root README; move/copy of `requirements-proof.txt` documentation.
-- Considering GraphQL query cost/complexity headers for throttling telemetry.
-- Visitor-facing caching of product pages (only if the agent needs it).
+- Request-lifetime Shopify client/token-manager singleton (currently fresh
+  per request; fine at current scale).
+- psycopg pooling (Neon latency): current design is one cached long-lived
+  connection guarded by the saver's internal lock; revisit only if live
+  performance shows a need.
+- Root README; `requirements-proof.txt` documentation notes.
+- GraphQL cost/complexity headers for throttling telemetry.
 
 ---
 
 ## 9. Known issues and decisions (do not reverse without discussion)
 
+**Phase 1–7 decisions (still binding).**
 1. **Scalar `Money` price: `ProductVariant.price` is a monetary string;
-   currency comes from `priceRange` (`MoneyV2`).** This was forced by a live
-   schema error and is regression-tested. Reverting it will break live calls.
+   currency comes from `priceRange` (`MoneyV2`).** Forced by a live schema
+   error; regression-tested. Reverting breaks live calls.
 2. **GraphQL error policy: any `errors` array rejects the whole response**
-   (502). Never "upgrade" this to partial-result merging without a structural
-   reason and new tests.
+   (502). Never upgrade to partial-result merging without a structural reason
+   and new tests.
 3. **Auth precedence: client credentials > static token**; placeholder-looking
-   values (contain `placeholder`, start `your_`, or the webhook placeholder)
-   are treated as unset (helpful `ConfigurationError` instead of a doomed call).
+   values are treated as unset (helpful `ConfigurationError` instead of a
+   doomed call).
 4. **`SHOPIFY_API_VERSION` validation** against a frozen supported list
-   (`2026-01`, `2026-04`, `2026-07`, `2026-10`); bump the list only after
-   re-checking shopify.dev's currently supported versions.
-5. **Docs read snippet-level.** shopify.dev could not be fetched directly from
-   this environment (DNS blocked); all schema claims relied on official-page
-   snippets via search plus live-server behavior. When a live error contradicts
-   a doc snippet, trust the live error and re-verify the schema.
-6. **No auto-retries.** 429 answers carry `Retry-After` (upstream value or a
+   (`2026-01`, `2026-04`, `2026-07`, `2026-10`); bump only after re-checking
+   shopify.dev.
+5. **No auto-retries.** 429 answers carry `Retry-After` (upstream or a
    documented 5 s fallback), but the backend never retries automatically.
-7. **One `httpx.Client` per request** (no pooling) — known inefficiency,
-   acceptable so far; do not "fix" casually during another feature.
-8. **Commit/push only after verification** (full pytest + `pip check` +
+6. **One `httpx.Client` per request** (no pooling) — known inefficiency,
+   acceptable; do not "fix" casually.
+7. **Commit/push only after verification** (full pytest + `pip check` +
    staged-diff secret scan) and only when the user asks. Never
    reset/rebase/force/discard.
-9. **Test counts per commit are historical facts** (22→39→44→50). Do not
-   re-align old commits' numbers when the suite grows.
+8. **Test counts per commit are historical facts** (22→39→44→50→108→120). Do
+   not re-align old commits' numbers when the suite grows.
+9. **Docs read snippet-level.** shopify.dev could not be fetched directly in
+   some rounds (DNS blocks); schema claims relied on official-page snippets
+   plus live-error behavior. When a live error contradicts a doc snippet,
+   trust the live error and re-verify the schema.
+
+**Phase 8 decisions (LLM agent — do not regress these).**
+10. **No sampling parameters are ever sent to Gemini.**
+    `temperature`/`top_p`/`top_k`/`candidate_count` are deprecated for
+    `gemini-3.6-flash` and ALL later Google models (official migration guide:
+    "remove from all requests"; may return HTTP 400). Determinism comes from
+    the strict system prompt (answers only from verified Shopify tool data).
+    Do not reintroduce them "to tune" behavior — remove-and-verify instead.
+11. **Thought signatures are captured and replayed verbatim** on persisted
+    model turns (Gemini 3.x baseline for multi-turn function calling;
+    verified SDK behavior: inbound base64-decode → bytes in state →
+    base64 re-encode on the wire).
+12. **Gemini error classification stays:** 429/5xx/timeout → fallback-eligible;
+    401/403, other 4xx (incl. HTTP 499 `CANCELLED` — pinned by a dedicated
+    test), safety refusals, network/parse errors → NOT eligible. 4xx messages
+    embed the SDK's structured `status`/sanitized one-line `message`; the full
+    body `.details` is never read and never echoed.
+13. **Never-invent rule:** agent answers use ONLY verified Shopify data.
+    Missing/null data means "unknown", never invented. The NVIDIA fallback is
+    generation-only (no tools, no second data source) and runs only when ALL
+    gates open: eligible Gemini failure + fallback enabled + NVIDIA key +
+    verified context. Approved grounding extension: for explicit `SKU-…`
+    references with no context (Gemini failed before tool selection), ONE
+    deterministic read-only lookup grounds the fallback (`product_stock`
+    first, one distinct `search_catalog` attempt only on no-match — never the
+    same lookup twice).
+14. **Controlled-503 diagnosability:** gate-closure reasons are static,
+    sanitized categories surfaced in the 503 detail (never bodies/DSNs).
+
+**Phase M1 decisions (memory).**
+15. **Storage split:** persistent conversation memory uses Neon PostgreSQL
+    via `langgraph-checkpoint-postgres` when `NEON_DATABASE_URL` is valid;
+    without it the app keeps the exact in-memory behavior. An unreachable
+    configured store raises a sanitized `MemoryDependencyError` → controlled
+    503 — **NEVER silently downgrade to memory** (that would invisibly lose
+    persistence). Mid-operation `psycopg.Error` maps the same way (history
+    itself stays server-side; nothing is silently lost).
+16. **Connection lifecycle (source-verified):** ONE long-lived psycopg
+    connection mirroring `from_conn_string` options (`autocommit=True`,
+    `prepare_threshold=0`, `row_factory=dict_row`); `PostgresSaver`'s own
+    `threading.Lock` serializes all DB ops; `setup()` runs once (idempotent).
+    Revisit pooling (psycopg-pool) only with live performance evidence.
+17. **Test isolation:** `backend/tests/conftest.py` pins every test to
+    in-memory mode and clears the singleton between tests; the fake-Neon
+    factory test opts into its stub explicitly. The suite NEVER reads the
+    real DSN or touches real Neon in any environment or ordering.
+18. **Memory-type plan (for later phases):** short-term = the checkpointer
+    (done); episodic/long-term = LangGraph Store namespaces sharing the same
+    Neon DB (not started); semantic = policies/FAQs (pgvector later), procedural
+    = system prompt/tools kept in code. Do not build Store-based memory before
+    the corresponding feature (FAQ retrieval) is approved.
+19. **Checkpointer table grants (docs):** dedicated role over the actual
+    setup-created tables `checkpoints`, `checkpoint_blobs`,
+    `checkpoint_writes` (read/write) + `checkpoint_migrations` (SELECT) —
+    never the admin superuser.
 
 ---
 
 ## 10. Instructions for the next AI assistant
 
-1. **Read this document first**, but then **verify the real repository state**
+1. **Read this document first**, then **verify the real repository state**
    (`git status`/`git log`/tests) before changing anything — never assume a
-   feature is complete because it is listed here. Uncommitted work may exist
-   or may have been moved/reverted by the user since this file was written.
-2. Continue from the **last verified checkpoint** (§7). If the working tree
-   differs from §7, ask the user what changed before touching anything.
-3. Work in **small, beginner-friendly steps**; explain technical concepts
-   simply; do not bundle unrelated changes into one step.
-4. Respect the boundaries: **Project 2 only**; never touch Project 1 or
-   Inventra; never grant/revoke Shopify scopes; strictly read-only Shopify
-   operations; never fetch/print tokens, secrets or `.env` contents.
-5. **Permission tests are guided, one at a time.** Give the user exact steps
-   (PowerShell + Swagger), state the expected pass/fail signal in advance, then
-   record the actual result in §6 and `backend/docs/shopify-setup.md`.
-6. **Never commit or push without** running the backend suite + `pip check` +
-   a staged-diff secret scan, showing the user what will be committed, and
-   waiting for explicit approval. No resets, rebases, force-pushes, or
-   discards unless the user explicitly instructs it.
-7. When a live test requires the user's action, **stop and wait** for their
+   feature is complete because it is listed here.
+2. Continue from §7 (`e8ca2ae`, clean tree). If the tree differs, ask the user
+   what changed before touching anything.
+3. Work in **small, beginner-friendly steps**; explain concepts simply; do not
+   bundle unrelated changes.
+4. Respect boundaries: **Project 2 only**; Inventra inspection is READ-ONLY
+   (never modify it, no wholesale copying without approval); never
+   grant/revoke Shopify scopes; strictly read-only Shopify operations; never
+   fetch/print tokens, secrets, DSNs, or `.env` contents.
+5. **Permission/live tests are guided, one at a time.** Give exact steps,
+   state the expected signal in advance, then record the actual result.
+6. **Never commit or push without** the backend suite + `pip check` +
+   staged-diff secret scan, showing the user what will be committed, and
+   waiting for explicit approval. No resets, rebases, force-pushes, discards.
+7. When a live test needs the user's action, **stop and wait** for their
    result; do not claim connectivity that has not been demonstrated.
-8. Maintain this handover file as the project grows (append phase outcomes,
-   keep the matrix current, mark unverified claims clearly).
+8. Maintain this handover as the project grows (append phase outcomes, keep
+   §6 and the decisions current, mark unverified claims clearly).
+
+---
+
+## 11. New Chat Continuation Prompt
+
+> Copy everything inside the block below into a new conversation to resume
+> exactly where this session left off. It states the verified state, the
+> binding decisions, the exact next task, and the working style — so nothing
+> already completed gets redone.
+
+```text
+Continue the Shopify AI Sales Agent project (Project 2). Read the repo and
+docs/PROJECT_HANDOVER.md first, then verify the real state with git
+status/log and a test run before touching anything.
+
+VERIFIED STATE (do not redo any of this):
+- Repo: shopify-ai-sales-agent; remote origin = github Csree94/shopify-ai-sales-agent;
+  branch main, clean tree; HEAD = e8ca2ae "Add Neon persistent conversation
+  memory" (= origin/main). Prior commits chain: b6d6280, 5cd3ae6, 6b3688e,
+  ffa908f, 1b1420d, 88bfa4c "Complete Phase 8 LangGraph sales agent",
+  e8ca2ae. Never amend or force-push.
+- Backend: FastAPI + LangGraph sales agent. Primary LLM = Gemini
+  (gemini-3.6-flash via GEMINI_API_KEY/GEMINI_MODEL), fallback = NVIDIA
+  Nemotron (generation-only; NVIDIA_API_KEY), read-only Shopify GraphQL Admin
+  tools (search_catalog, product_stock), chat endpoint POST /api/chat.
+  Persistent per-session conversation memory in Neon PostgreSQL
+  (langgraph-checkpoint-postgres, NEON_DATABASE_URL); in-memory fallback when
+  unconfigured; failing configured store => controlled 503, never a silent
+  downgrade. Test isolation: backend/tests/conftest.py pins every automated
+  test to in-memory mode (never real Neon).
+- Suite: 120 backend tests, fully offline; pip check clean; git diff --check
+  clean. Real Neon persistence across a backend restart was verified live.
+  Real store data verified live via /api/products and
+  /api/products/inventory?detail=levels URLs; client-credentials Shopify auth.
+
+BINDING CONSTRAINTS AND DECISIONS (from PROJECT_HANDOVER.md §9 — do not regress):
+- Shopify is the ONLY source of truth for prices/stock; missing data = say
+  unknown; never invent product facts; agent answers need verified Shopify
+  context (fallback runs only when all gates open; explicit SKU questions can
+  ground ONE deterministic read-only lookup when Gemini fails before tool
+  use).
+- Never send sampling parameters (temperature/top_p/top_k) to Gemini 3.6+;
+  replay Gemini 3.x thought signatures verbatim on model turns.
+- HTTP 499 CANCELLED is non-retryable (pinned by test); 429/5xx/timeout are
+  fallback-eligible; 4xx/auth/safety are not.
+- Read-only Shopify only; no write_* scopes ever; Admin GraphQL 2026-10 only.
+- Never print/echo .env values, API keys, tokens, or the Neon DSN; all
+  credential reprs are redacted; nothing logged.
+- No auto-retries anywhere; no code changes or commits without my approval;
+  full pytest + pip check + secret scan before any commit; no
+  resets/rebases/force-pushes.
+
+EXACT NEXT TASK (Phase: Telegram, per the approved plan):
+1. Inspect the earlier "Inventra" project READ-ONLY to identify reusable
+   Telegram integration code. First find the path (ask me if not obvious),
+   read-only only: report what it actually implements (bot client creation,
+   polling vs webhook, webhook verification, message routing, error mapping)
+   and what is missing — do not assume it is complete or working until
+   inspected. Do not copy anything without my explicit approval.
+2. Then connect Telegram to the existing agent: a Telegram surface that
+   reuses run_chat()'s existing result fields (reply/session_id/
+   fallback_used), maps provider/store errors to safe Telegram messages,
+   validates Telegram webhook secrets, and treats TELEGRAM_BOT_TOKEN /
+   TELEGRAM_WEBHOOK_SECRET exactly like every other secret in this project.
+   Design polling-vs-webhook with me before building.
+
+AFTER THAT (planned order — confirm each against my teacher's actual
+specification before building; do not self-invent requirements):
+FAQs/store-policy retrieval (semantic memory / RAG on Neon), product
+recommendations, remaining frontend, security hardening, caching/limiting,
+admin dashboard/WebSocket, deployment, teacher-spec testing.
+
+WORKING STYLE: small beginner-friendly steps; explain concepts simply;
+distinguish verified facts from user-reported facts and from NOT-TESTED
+items; keep docs/PROJECT_HANDOVER.md updated as the source of truth; ask
+before any live API call, secret access, or git operation; stop for review
+at each approved step boundary.
+```
