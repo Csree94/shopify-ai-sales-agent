@@ -30,9 +30,121 @@ DEFAULT_API_VERSION = "2026-10"
 DEFAULT_TIMEOUT_SECONDS = 15.0
 MAX_GQL_PAGE_SIZE = 250
 
+# Model default (verified against ai.google.dev model docs, 2026-10-15):
+# gemini-3.6-flash is a Stable endpoint today, but per Google's lifecycle page
+# it is a short-term availability model with an announced retirement window of
+# 2026-11-19 (successor: gemini-3.8-flash, GA 2026-09-02 → ≥2027-09-02). The
+# switch from gemini-3.8-flash was made for live-availability reasons pending
+# a review of the 503s; revisit GEMINI_MODEL before 2026-11-19.
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
+# NVIDIA's OpenAI-compatible endpoint (integrate.api.nvidia.com/v1).
+DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
 
 class ConfigurationError(RuntimeError):
     """Raised when required Shopify configuration is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class GeminiSettings:
+    """Validated Gemini (Google AI) settings — Phase 8.
+
+    The API key is treated exactly like the Shopify credentials: read from
+    the environment at call time, redacted in repr, never logged. The model
+    names are plain identifiers, safe to display.
+    """
+
+    api_key: str
+    model: str = DEFAULT_GEMINI_MODEL
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"GeminiSettings(model={self.model!r}, api_key=<redacted>)"
+
+
+@dataclass(frozen=True)
+class NvidiaSettings:
+    """Validated NVIDIA Nemotron settings — Phase 8 generation-only fallback.
+
+    ``api_key`` may be empty when no fallback is configured; ``agent`` code
+    must treat an empty key as 'fallback unavailable', never as an empty
+    credential. The key is redacted in repr and never logged.
+    """
+
+    api_key: str = ""
+    model: str = DEFAULT_NVIDIA_MODEL
+    base_url: str = DEFAULT_NVIDIA_BASE_URL
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"NvidiaSettings(model={self.model!r}, base_url={self.base_url!r}, "
+            "api_key=<redacted>)"
+        )
+
+
+@dataclass(frozen=True)
+class LLMSettings:
+    """Phase 8 LLM wiring used by /api/chat.
+
+    ``fallback_enabled`` comes from ``LLM_FALLBACK_ENABLED`` (default true).
+    Even when enabled, the fallback only runs if ``nvidia.api_key`` is set —
+    availability of both is checked by the agent, not assumed here.
+    """
+
+    gemini: GeminiSettings
+    nvidia: NvidiaSettings
+    fallback_enabled: bool = True
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"LLMSettings(gemini={self.gemini!r}, nvidia={self.nvidia!r}, "
+            f"fallback_enabled={self.fallback_enabled!r})"
+        )
+
+
+def load_llm_settings(
+    env: dict[str, str] | None = None,
+) -> LLMSettings:
+    """Validate Gemini + optional NVIDIA fallback settings (never prints values)."""
+    if env is None:
+        load_local_env_files()
+    source = os.environ if env is None else env
+
+    gemini_key_raw = (source.get("GEMINI_API_KEY") or "").strip()
+    gemini_key = "" if _looks_like_placeholder(gemini_key_raw) else gemini_key_raw
+    if not gemini_key:
+        raise ConfigurationError(
+            "GEMINI_API_KEY is not set (expected a Google AI Studio API key "
+            "in your local .env — never commit it)."
+        )
+
+    gemini_model = (source.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+
+    nvidia_api_key_raw = (source.get("NVIDIA_API_KEY") or "").strip()
+    nvidia_api_key = (
+        "" if _looks_like_placeholder(nvidia_api_key_raw) else nvidia_api_key_raw
+    )
+    nvidia = NvidiaSettings(
+        api_key=nvidia_api_key,
+        model=(source.get("NVIDIA_LLM_MODEL") or DEFAULT_NVIDIA_MODEL).strip(),
+        base_url=(source.get("NVIDIA_LLM_BASE_URL") or DEFAULT_NVIDIA_BASE_URL).strip(),
+    )
+
+    fallback_raw = (source.get("LLM_FALLBACK_ENABLED") or "").strip().lower()
+    if fallback_raw in ("", "1", "true", "yes", "on"):
+        fallback_enabled = True
+    elif fallback_raw in ("0", "false", "no", "off"):
+        fallback_enabled = False
+    else:
+        raise ConfigurationError(
+            "LLM_FALLBACK_ENABLED must be one of: 1/true/yes/on or 0/false/no/off."
+        )
+
+    return LLMSettings(
+        gemini=GeminiSettings(api_key=gemini_key, model=gemini_model),
+        nvidia=nvidia,
+        fallback_enabled=fallback_enabled,
+    )
 
 
 @dataclass(frozen=True)

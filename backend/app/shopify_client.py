@@ -175,7 +175,11 @@ class ShopifyAdminClient:
         return self._fetch_products(first=limit, after=cursor, query=query.strip())
 
     def list_inventory(
-        self, limit: int, cursor: str | None = None, detail: str = "quantities"
+        self,
+        limit: int,
+        cursor: str | None = None,
+        detail: str = "quantities",
+        query: str | None = None,
     ) -> dict:
         """Inventory probe (Phase 6): read-only per-variant stock quantities.
 
@@ -183,6 +187,9 @@ class ShopifyAdminClient:
         detail="levels" (Phase 7): additionally selects the strict
         `InventoryLevel` chain (`inventoryItem -> inventoryLevels ->
         quantities`), whose access requires the `read_inventory` scope.
+        The optional `query` (Phase 8) narrows the store to matching products
+        (Shopify search syntax); passing it must not change the default-mode
+        behavior — with no query the request is identical to the Phase 6 probe.
         Strictly read-only: this never writes or adjusts any store data.
         """
         limit = _clamp_limit(limit)
@@ -190,7 +197,9 @@ class ShopifyAdminClient:
             gql = PRODUCTS_INVENTORY_LEVELS_QUERY
         else:
             gql = PRODUCTS_INVENTORY_QUERY
-        return self._fetch_products(first=limit, after=cursor, query=None, gql=gql)
+        return self._fetch_products(
+            first=limit, after=cursor, query=query, gql=gql
+        )
 
     # -- internals ---------------------------------------------------------
 

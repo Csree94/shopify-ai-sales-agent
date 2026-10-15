@@ -139,7 +139,7 @@ class InventoryLevelsListResponse(BaseModel):
 # -- error mapping ---------------------------------------------------------
 
 
-def _to_http_exception(exc: ShopifyClientError) -> HTTPException:
+def to_http_exception(exc: ShopifyClientError) -> HTTPException:
     if isinstance(exc, ShopifyAuthError):
         return HTTPException(status_code=401, detail=str(exc))
     if isinstance(exc, ShopifyThrottledError):
@@ -161,7 +161,7 @@ def _run(call) -> ProductListResponse:
     try:
         connection = call()
     except ShopifyClientError as exc:
-        raise _to_http_exception(exc) from exc
+        raise to_http_exception(exc) from exc
     nodes = connection.get("nodes") or []
     page = connection.get("pageInfo") or {}
     return ProductListResponse(
@@ -226,7 +226,7 @@ def list_inventory(
             limit=limit, cursor=cursor, detail=detail
         )
     except ShopifyClientError as exc:
-        raise _to_http_exception(exc) from exc
+        raise to_http_exception(exc) from exc
     nodes = connection.get("nodes") or []
     page = connection.get("pageInfo") or {}
     page_info = PageInfoOut(
