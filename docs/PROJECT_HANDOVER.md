@@ -8,8 +8,11 @@
 Created: 2026-10 (during the Phase 7 review round).
 Updated: Phase 8 (Gemini/LangGraph sales agent + NVIDIA fallback) and Phase M1
 (Neon-backed persistent conversation memory) are IMPLEMENTED, TESTED, and
-PUSHED (`e8ca2ae` on `origin/main`). Telegram integration is the next planned
-phase (see §8/§11 for the exact continuation prompt).
+PUSHED (`e8ca2ae` on `origin/main`). The optional Telegram integration
+(Stage 1 transport/config + Stage 2 webhook→agent wiring) is IMPLEMENTED
+and TESTED in the working tree — see the deployment constraint in §2 (one
+Uvicorn worker). Admin dashboard, RAG and checkout remain planned
+(§8/§11 prompts are superseded where they describe Telegram as not started).
 Repository: `C:\Users\harik\Desktop\Sree_new\shopify-ai-sales-agent`
 Remote: `https://github.com/Csree94/shopify-ai-sales-agent.git`
 
@@ -23,7 +26,10 @@ search, inventory), an LLM chat service (LangGraph agent with a Gemini
 primary model and an NVIDIA Nemotron generation-only fallback), a FastAPI chat
 surface (`POST /api/chat`), and persistent per-session conversation memory in
 Neon PostgreSQL. The frontend is a React + TypeScript + Vite scaffold (still
-bare). Still **not** implemented: Telegram chat surface, FAQ/policy retrieval
+bare). The **optional** Telegram chat surface is implemented (private 1:1
+text chats only): a secret-verified `POST /api/telegram/webhook`, a
+repository-level Bot API client, and the same `run_chat` agent with
+duplicate-update protection. Still **not** implemented: FAQ/policy retrieval
 (RAG), proactive product recommendations, a checkout flow, admin dashboard,
 caching/limiting, deployment.
 
@@ -78,6 +84,19 @@ cd C:\Users\harik\Desktop\Sree_new\shopify-ai-sales-agent\backend
 ..\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
 ```
 
+**Deployment constraint — one Uvicorn worker (required, not optional):**
+the Telegram webhook must run in a single worker process. The duplicate-update
+guard (`backend/app/telegram/dedup.py`) is durable per process (LangGraph
+checkpoints have no compare-and-swap, so two workers can race the same
+`tg-dedup:{user_id}` ledger thread and both accept a redelivered update →
+duplicate replies and corrupted conversation checkpoints). Run uvicorn with
+exactly one worker (plain `uvicorn app.main:app`, `--workers 1`, or `gunicorn
+-k uvicorn.workers.UvicornWorker -w 1`). Do NOT scale by adding workers or
+replicas until the dedup design is migrated to a store with atomic claims
+(e.g. a checked-out/locked row or Redis `SET NX`). This also holds for the
+web chat session locks (`app.telegram.service.SessionLockMap`), which are
+per-process by design.
+
 **Frontend (rarely needed so far):** `cd frontend && npm install && npm run build`
 (tsc + vite build; verified clean in earlier phases).
 
@@ -98,8 +117,16 @@ environment variables always win; values are never printed):
   (`https://integrate.api.nvidia.com/v1`), `LLM_FALLBACK_ENABLED`.
 - Memory (Phase M1 — now actively read): `NEON_DATABASE_URL` (postgres:// DSN;
   unset/placeholder → in-memory mode; setup steps in `.env.example`).
+- Telegram (Stage 1+2 — now actively read, OPTIONAL like Neon):
+  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`. Unset/placeholder token →
+  integration disabled (503 webhook route, everything else unchanged). A real
+  token makes `TELEGRAM_WEBHOOK_SECRET` REQUIRED — the app fails fast at
+  startup and per-request otherwise — and the SAME value must be passed to
+  Telegram's `setWebhook` as `secret_token`; every webhook request must carry
+  it in `X-Telegram-Bot-Api-Secret-Token` (constant-time check). Details in
+  `.env.example`.
 - Still future (placeholders exist, nothing reads them yet):
-  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `DATABASE_URL`, `REDIS_URL`.
+  `DATABASE_URL`, `REDIS_URL`.
 
 **Editor instructions are** `backend/docs/shopify-setup.md` (**auth modes,
 required scopes, permission-test procedures**). That file is the source of
@@ -198,7 +225,8 @@ backend-only (pytest); frontend verified via `npm run build`.
 | `GET /api/products/search?q=` | implemented (same pagination) | Phase 4 |
 | `GET /api/products/inventory?limit&cursor&detail` | implemented (`detail=quantities` default; `detail=levels` = strict `read_inventory` probe, sending `quantities(names: ["available"])`) | Phase 6/7 (live strict probe: PASS, see §5/§6) |
 | `POST /api/chat` | implemented; live-verified end-to-end (see §5) | Phase 8 (memory M1) |
-| Checkout / Telegram / RAG / docs-retrieval / recommendations / dashboard | not implemented | planned (§8) |
+| `POST /api/telegram/webhook` | implemented (Stage 2); offline-tested; secret-verified; ack-then-background pipeline with durable dedup | Telegram Stage 1+2 (see §2 worker constraint) |
+| Checkout / RAG / docs-retrieval / recommendations / dashboard | not implemented | planned (§8) |
 
 **API boundary rules (important).**
 - Admin API = `https://{store}.myshopify.com/admin/api/{v}/graphql.json` with

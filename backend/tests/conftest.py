@@ -15,6 +15,51 @@ from __future__ import annotations
 import pytest
 
 import app.memory_db as memory_db
+from app.telegram.service import reset_session_locks
+from app.telegram.dedup import reset_duplicate_guard
+
+
+@pytest.fixture(autouse=True)
+def pin_telegram_disabled(monkeypatch):
+    """Run every test with Telegram DISABLED, independent of the local env.
+
+    Mirrors the M1 checkpointer-isolation policy: the lifespan reads the real
+    environment (and the git-ignored .env files) when a TestClient enters its
+    context; a stray real TELEGRAM_BOT_TOKEN would otherwise construct a real
+    TelegramClient during tests. Explicit EMPTY values win over .env files
+    (process environment beats dotenv here, same as the runtime override
+    rule). Tests that need an enabled integration set the variables again in
+    their own fixture — the later monkeypatch set wins within the scope.
+    """
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "")
+
+
+@pytest.fixture(autouse=True)
+def reset_dedup_guard():
+    """Clear the per-process duplicate-update registry around every test."""
+    reset_duplicate_guard()
+    try:
+        yield
+    finally:
+        reset_duplicate_guard()
+
+
+@pytest.fixture(autouse=True)
+def reset_session_lock_map():
+    """Clear the per-process session-lock map around every test.
+
+    asyncio.Lock objects bind to the event loop that first WAITS on them;
+    tests run per-scenario loops (asyncio.run), so a lock created under one
+    loop would raise 'bound to a different event loop' under the next.
+    Production never needs this: one uvicorn loop for the whole process.
+    Mirrors the reset_dedup_guard / reset_postgres_singleton policy.
+    """
+    reset_session_locks()
+    try:
+        yield
+    finally:
+        reset_session_locks()
 
 
 @pytest.fixture(autouse=True)

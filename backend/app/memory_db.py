@@ -110,6 +110,58 @@ def _default_checkpointer() -> BaseCheckpointSaver:
         return _postgres_checkpointer  # type: ignore[return-value]
 
 
+def checkpointer_connection_broken(saver: object) -> bool:
+    """Whether the saver's psycopg connection was transport-interrupted.
+
+    psycopg3 sets ``conn.broken`` ONLY when the server dropped the socket
+    (idle compute suspension, network reset) — never after a clean
+    ``close()``. Savers without a psycopg connection (``InMemorySaver``, test
+    stubs) are never broken-by-connection: they return ``False``, so no
+    code path ever attempts a reconnect against them. Deliberately
+    conservative: only this exact transport state qualifies a retry.
+    """
+    conn = getattr(saver, "conn", None)
+    return getattr(conn, "broken", None) is True
+
+
+def reopen_postgres_checkpointer() -> BaseCheckpointSaver:
+    """Production reconnect: rebuild the Neon saver over a FRESH connection.
+
+    Long-lived idle Postgres connections die when the server (Neon free
+    tier) suspends the compute between messages; every later checkpoint op
+    then fails instantly on the broken socket for the LIFE of the process
+    (“one update succeeded, the rest got the friendly error”). This rebuilds
+    the saver (fresh psycopg connection + the library's idempotent
+    ``setup()`` DDL) and re-caches the singleton, so the store STAYS
+    Postgres — never silently downgraded to in-memory. Raises
+    ``MemoryDependencyError`` (no DSN/credential material) when no Postgres
+    store is in use or the rebuild fails.
+    """
+    global _postgres_checkpointer
+    # SLOW section guarded by the start lock: at most one reconnect runs at
+    # a time; concurrent ``get_checkpointer`` readers only ever see the last
+    # valid instance (single-attribute swap).
+    with _postgres_start_lock:
+        if _postgres_checkpointer is not None:
+            if not checkpointer_connection_broken(_postgres_checkpointer):
+                # Another thread already rebuilt the saver before us.
+                return _postgres_checkpointer
+            _postgres_checkpointer = None
+        if _memory_checkpointer is not None:
+            raise MemoryDependencyError(
+                "No Neon checkpoint store is configured; "
+                "reconnect is not applicable."
+            )
+        settings = load_neon_settings()
+        if settings is None:
+            raise MemoryDependencyError(
+                "No Neon checkpoint store is configured; "
+                "reconnect is not applicable."
+            )
+        _postgres_checkpointer = _build_postgres_saver(settings.dsn)
+        return _postgres_checkpointer
+
+
 def get_checkpointer() -> BaseCheckpointSaver:
     """The app's conversation checkpointer (seam-aware, lifecycle-managed)."""
     factory = checkpointer_factory if checkpointer_factory is not None else _default_checkpointer

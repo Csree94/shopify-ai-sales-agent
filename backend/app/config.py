@@ -349,3 +349,61 @@ def load_neon_settings(env: dict[str, str] | None = None) -> NeonSettings:
             "connection string (value itself is never echoed)."
         )
     return NeonSettings(dsn=dsn_raw)
+
+
+# -- Telegram (Stage 1: transport configuration only) ------------------------
+
+
+@dataclass(frozen=True)
+class TelegramSettings:
+    """Validated Telegram Bot API settings (Stage 1: config + transport only).
+
+    ``bot_token`` and ``webhook_secret`` are secrets — both repr/str are
+    redacted and neither value is ever echoed in logs, errors, or tests.
+    Telegram is an OPTIONAL integration, following the ``NeonSettings``
+    convention: unset/placeholder ``TELEGRAM_BOT_TOKEN`` → ``None`` (the rest
+    of the app keeps its exact behavior). A real token with a missing or
+    placeholder webhook secret is a misconfiguration (the webhook would run
+    unauthenticated) and is rejected outright.
+    """
+
+    bot_token: str
+    webhook_secret: str
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return "TelegramSettings(bot_token=<redacted>, webhook_secret=<redacted>)"
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return "TelegramSettings(bot_token=<redacted>, webhook_secret=<redacted>)"
+
+
+def load_telegram_settings(env: dict[str, str] | None = None) -> TelegramSettings | None:
+    """Validate the optional Telegram settings (never prints values).
+
+    Reads ``TELEGRAM_BOT_TOKEN`` / ``TELEGRAM_WEBHOOK_SECRET`` from the given
+    mapping (default: ``os.environ``, after silently loading the local .env
+    files like every other loader).
+
+    - Token unset or placeholder → ``None``: Telegram is disabled, exactly
+      like an unset ``NEON_DATABASE_URL``.
+    - Real token but unset/placeholder secret → ``ConfigurationError`` naming
+      the variable (but never any secret value).
+    """
+    if env is None:
+        load_local_env_files()
+    source = os.environ if env is None else env
+
+    token_raw = (source.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    bot_token = "" if _looks_like_placeholder(token_raw) else token_raw
+    if not bot_token:
+        return None
+
+    secret_raw = (source.get("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+    webhook_secret = "" if _looks_like_placeholder(secret_raw) else secret_raw
+    if not webhook_secret:
+        raise ConfigurationError(
+            "TELEGRAM_WEBHOOK_SECRET is not set while TELEGRAM_BOT_TOKEN is "
+            "configured; a Telegram bot must reject unauthenticated webhooks "
+            "(value itself is never echoed)."
+        )
+    return TelegramSettings(bot_token=bot_token, webhook_secret=webhook_secret)

@@ -6,6 +6,9 @@
   success (primary Gemini or fallback Nemotron; `fallback_used` is True
   only when the generation-only NVIDIA fallback produced the answer).
 - 422 (pydantic) for malformed request bodies; 400 for an empty message.
+- 422 for a client-supplied session id in a reserved Telegram namespace
+  (`tg:` / `tg-dedup:` prefixes — the ids owned by the Telegram surface
+  and its dedup ledger; see app.telegram.service / app.telegram.dedup).
 - 500 when LLM configuration is missing/invalid (same convention as the
   Shopify configuration surface: named-variable message, no secrets).
 - Shopify tool failures keep their exact existing mapping (401/429 with
@@ -35,6 +38,14 @@ from app.shopify_client import ShopifyClientError
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
+# Session-id namespaces owned by the Telegram surface: `tg:{user_id}` is the
+# conversation checkpoint thread of a Telegram customer and
+# `tg-dedup:{user_id}` is that customer's durable dedup ledger
+# (see app.telegram.service / app.telegram.dedup). A client-supplied web
+# session id colliding with either would let one surface read or corrupt the
+# other's LangGraph checkpoint history, so both prefixes are rejected (422).
+RESERVED_SESSION_PREFIXES = ("tg:", "tg-dedup:")
+
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, description="Customer question.")
@@ -52,9 +63,23 @@ class ChatResponse(BaseModel):
 
 
 def _session_id(session_id: str | None) -> str:
-    # A missing client id gets a request-local session: the conversation is
-    # still checkpointed in memory, just never continued from another call.
-    return session_id if session_id and session_id.strip() else "__single_turn__"
+    """The conversation key for one request (reserved prefixes → 422).
+
+    A missing client id gets a request-local session: the conversation is
+    still checkpointed in memory, just never continued from another call.
+    Validation runs on the stripped value; any other non-blank id is passed
+    through unchanged (prior behavior preserved exactly).
+    """
+    value = (session_id or "").strip()
+    if value.startswith(RESERVED_SESSION_PREFIXES):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Session ids prefixed with 'tg:' or 'tg-dedup:' are reserved "
+                "for the Telegram surface."
+            ),
+        )
+    return session_id if value else "__single_turn__"
 
 
 @router.post("/chat", response_model=ChatResponse)
